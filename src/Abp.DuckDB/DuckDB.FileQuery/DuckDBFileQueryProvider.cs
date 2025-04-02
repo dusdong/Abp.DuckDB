@@ -158,8 +158,8 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
             stopwatch.Stop();
 
             _logger.Info($"[DuckDB流式处理] 文件数: {filePaths.Count()} | " +
-                         $"总记录数: {totalProcessed} | 批大小: {batchSize} | " +
-                         $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                $"总记录数: {totalProcessed} | 批大小: {batchSize} | " +
+                $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             _logger.Debug($"[DuckDB流式SQL] {sql}");
 
@@ -180,7 +180,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         Expression<Func<TEntity, bool>> predicate = null,
         int batchSize = 1000,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
-        CancellationToken cancellationToken = default)
+            CancellationToken cancellationToken = default)
     {
         ValidateFilePaths(filePaths);
 
@@ -235,8 +235,8 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         {
             stopwatch.Stop();
             _logger.Info($"[DuckDB流式枚举] 文件数: {filePaths.Count()} | " +
-                         $"总记录数: {processedCount} | " +
-                         $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                $"总记录数: {processedCount} | " +
+                $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             _logger.Debug($"[DuckDB流式SQL] {sql}");
         }
@@ -287,7 +287,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
 
             stopwatch.Stop();
             _logger.Info($"[DuckDB批处理指标] 批量查询 | 文件数: {filePaths.Count()} | " +
-                         $"查询数: {predicatesMap.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                $"查询数: {predicatesMap.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             return results;
         }
@@ -354,33 +354,10 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
             var aggregations = string.Join(", ",
                 metricsMap.Select(m => $"{m.Value} AS {m.Key}"));
 
-            string sql;
-
-            // 检查是否支持数组语法
-            if (filePaths.Count() > 1 && filePaths.Count() <= 10)
-            {
-                var escapedPaths = filePaths.Select(p => $"'{p.Replace("'", "''")}'");
-                string pathArray = $"[{string.Join(", ", escapedPaths)}]";
-
-                sql = $"SELECT {aggregations} FROM read_parquet({pathArray})";
-                if (!string.IsNullOrEmpty(whereClause))
-                    sql += $" WHERE {whereClause}";
-            }
-            else if (filePaths.Count() == 1)
-            {
-                // 单文件查询
-                string escapedPath = filePaths.First().Replace("'", "''");
-                sql = $"SELECT {aggregations} FROM read_parquet('{escapedPath}')";
-
-                if (!string.IsNullOrEmpty(whereClause))
-                    sql += $" WHERE {whereClause}";
-            }
-            else
-            {
-                // 多文件先合并再计算
-                var baseQuery = BuildDirectParquetQuery(filePaths, whereClause);
-                sql = $"SELECT {aggregations} FROM ({baseQuery}) AS combined_data";
-            }
+            // 构建查询
+            string sql = $"SELECT {aggregations} FROM {BuildParquetSourceClause(filePaths)}";
+            if (!string.IsNullOrEmpty(whereClause))
+                sql += $" WHERE {whereClause}";
 
             // 执行查询
             var result = new Dictionary<string, decimal>();
@@ -401,7 +378,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
 
             stopwatch.Stop();
             _logger.Info($"[DuckDB批处理指标] 多指标查询 | 文件数: {filePaths.Count()} | " +
-                         $"指标数: {metricsMap.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                $"指标数: {metricsMap.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             _logger.Debug($"[DuckDB指标SQL] {sql}");
 
@@ -488,7 +465,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
 
             stopwatch.Stop();
             _logger.Info($"[DuckDB批处理指标] 分页查询 | 文件数: {filePaths.Count()} | " +
-                         $"总数: {totalCount} | 页数据: {items.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                $"总数: {totalCount} | 页数据: {items.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             return (items, totalCount);
         }
@@ -734,8 +711,8 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         }
         catch (Exception ex)
         {
-            _logger.Error($"执行自定义SQL查询失败: {ex.Message}", ex);
-            throw;
+            _logger.Error($"执行自定义SQL查询失败: {ex.Message}，SQL语句：{sql}", ex);
+            throw new Exception($"执行自定义SQL查询失败", ex);
         }
     }
 
@@ -764,8 +741,8 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
 
             // 记录基本指标
             _logger.Info($"[DuckDB指标] 类型: {queryType} | 文件数: {filesCount} | " +
-                         $"结果数: {(resultCount >= 0 ? resultCount.ToString() : "N/A")} | " +
-                         $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                $"结果数: {(resultCount >= 0 ? resultCount.ToString() : "N/A")} | " +
+                $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             _logger.Debug($"[DuckDB指标SQL] {sql}");
 
@@ -775,7 +752,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         {
             stopwatch.Stop();
             _logger.Error($"[DuckDB指标错误] 类型: {queryType} | 文件数: {filesCount} | " +
-                          $"执行时间: {stopwatch.ElapsedMilliseconds}ms | 错误: {ex.Message}");
+                $"执行时间: {stopwatch.ElapsedMilliseconds}ms | 错误: {ex.Message}");
             throw;
         }
     }
@@ -908,9 +885,20 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     }
 
     /// <summary>
-    /// 直接构建查询SQL，不使用CTE，避免语法错误（使用缓存转换表达式）
+    /// 构建Parquet数据源子句，使用列表语法
     /// </summary>
-    private string BuildDirectParquetQuery<TEntity>(IEnumerable<string> filePaths,
+    private string BuildParquetSourceClause(IEnumerable<string> filePaths)
+    {
+        var escapedPaths = filePaths.Select(p => $"'{p.Replace("'", "''")}'");
+        string pathList = string.Join(", ", escapedPaths);
+        return $"read_parquet([{pathList}])";
+    }
+
+    /// <summary>
+    /// 直接构建查询SQL，使用列表语法
+    /// </summary>
+    private string BuildDirectParquetQuery<TEntity>(
+        IEnumerable<string> filePaths,
         Expression<Func<TEntity, bool>> predicate = null,
         IEnumerable<string> selectedColumns = null)
     {
@@ -919,7 +907,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     }
 
     /// <summary>
-    /// 构建直接的Parquet查询
+    /// 构建直接的Parquet查询，使用列表语法
     /// </summary>
     private string BuildDirectParquetQuery(
         IEnumerable<string> filePaths,
@@ -933,168 +921,55 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
             columns = string.Join(", ", selectedColumns);
         }
 
-        // 检查是否支持数组语法
-        bool useArraySyntax = false;
-        try
+        // 使用列表语法
+        string sql = $"SELECT {columns} FROM {BuildParquetSourceClause(filePaths)}";
+        
+        // 添加WHERE子句（如果有）
+        if (!string.IsNullOrEmpty(whereClause))
         {
-            // 通过简单测试确定DuckDB版本是否支持数组语法
-            if (filePaths.Count() > 1 && filePaths.Count() <= 10)
-            {
-                useArraySyntax = true;
-            }
-        }
-        catch
-        {
-            // 如果出错，就不使用数组语法
-            useArraySyntax = false;
+            sql += $" WHERE {whereClause}";
         }
 
-        if (useArraySyntax)
-        {
-            // 使用数组语法
-            var escapedPaths = filePaths.Select(p => $"'{p.Replace("'", "''")}'");
-            string pathArray = $"[{string.Join(", ", escapedPaths)}]";
-
-            string sql = $"SELECT {columns} FROM read_parquet({pathArray})";
-            if (!string.IsNullOrEmpty(whereClause))
-                sql += $" WHERE {whereClause}";
-
-            return sql;
-        }
-        else if (filePaths.Count() == 1)
-        {
-            // 单文件查询，简化语法
-            string escapedPath = filePaths.First().Replace("'", "''");
-            string sql = $"SELECT {columns} FROM read_parquet('{escapedPath}')";
-
-            if (!string.IsNullOrEmpty(whereClause))
-                sql += $" WHERE {whereClause}";
-
-            return sql;
-        }
-        else
-        {
-            // 大量文件仍使用UNION ALL查询
-            var queries = new List<string>();
-
-            foreach (var filePath in filePaths)
-            {
-                string escapedPath = filePath.Replace("'", "''");
-                string query = $"SELECT {columns} FROM read_parquet('{escapedPath}')";
-
-                if (!string.IsNullOrEmpty(whereClause))
-                    query += $" WHERE {whereClause}";
-
-                queries.Add(query);
-            }
-
-            return string.Join(" UNION ALL ", queries);
-        }
+        return sql;
     }
 
     /// <summary>
-    /// 构建直接的Parquet计数查询
+    /// 构建直接的Parquet计数查询，使用列表语法
     /// </summary>
     private string BuildDirectParquetCountQuery(IEnumerable<string> filePaths, string whereClause)
     {
-        // 检查是否支持数组语法
-        bool useArraySyntax = false;
-        try
+        string sql = $"SELECT COUNT(*) FROM {BuildParquetSourceClause(filePaths)}";
+        
+        // 添加WHERE子句（如果有）
+        if (!string.IsNullOrEmpty(whereClause))
         {
-            if (filePaths.Count() > 1 && filePaths.Count() <= 10)
-            {
-                useArraySyntax = true;
-            }
-        }
-        catch
-        {
-            useArraySyntax = false;
+            sql += $" WHERE {whereClause}";
         }
 
-        if (useArraySyntax)
-        {
-            var escapedPaths = filePaths.Select(p => $"'{p.Replace("'", "''")}'");
-            string pathArray = $"[{string.Join(", ", escapedPaths)}]";
-
-            string sql = $"SELECT COUNT(*) FROM read_parquet({pathArray})";
-            if (!string.IsNullOrEmpty(whereClause))
-                sql += $" WHERE {whereClause}";
-
-            return sql;
-        }
-        else if (filePaths.Count() == 1)
-        {
-            // 单文件查询计数
-            string escapedPath = filePaths.First().Replace("'", "''");
-            string sql = $"SELECT COUNT(*) FROM read_parquet('{escapedPath}')";
-
-            if (!string.IsNullOrEmpty(whereClause))
-                sql += $" WHERE {whereClause}";
-
-            return sql;
-        }
-        else
-        {
-            // 多文件先合并再计数
-            var baseQuery = BuildDirectParquetQuery(filePaths, whereClause);
-            return $"SELECT COUNT(*) FROM ({baseQuery}) AS combined_data";
-        }
+        return sql;
     }
 
     /// <summary>
-    /// 构建直接的Parquet聚合查询(SUM, AVG, MIN, MAX)
+    /// 构建直接的Parquet聚合查询，使用列表语法
     /// </summary>
     private string BuildDirectParquetAggregateQuery(
         IEnumerable<string> filePaths,
         string aggregateFunction,
         string whereClause)
     {
-        // 检查是否支持数组语法
-        bool useArraySyntax = false;
-        try
+        string sql = $"SELECT {aggregateFunction} FROM {BuildParquetSourceClause(filePaths)}";
+        
+        // 添加WHERE子句（如果有）
+        if (!string.IsNullOrEmpty(whereClause))
         {
-            if (filePaths.Count() > 1 && filePaths.Count() <= 10)
-            {
-                useArraySyntax = true;
-            }
-        }
-        catch
-        {
-            useArraySyntax = false;
+            sql += $" WHERE {whereClause}";
         }
 
-        if (useArraySyntax)
-        {
-            var escapedPaths = filePaths.Select(p => $"'{p.Replace("'", "''")}'");
-            string pathArray = $"[{string.Join(", ", escapedPaths)}]";
-
-            string sql = $"SELECT {aggregateFunction} FROM read_parquet({pathArray})";
-            if (!string.IsNullOrEmpty(whereClause))
-                sql += $" WHERE {whereClause}";
-
-            return sql;
-        }
-        else if (filePaths.Count() == 1)
-        {
-            // 单文件查询聚合
-            string escapedPath = filePaths.First().Replace("'", "''");
-            string sql = $"SELECT {aggregateFunction} FROM read_parquet('{escapedPath}')";
-
-            if (!string.IsNullOrEmpty(whereClause))
-                sql += $" WHERE {whereClause}";
-
-            return sql;
-        }
-        else
-        {
-            // 多文件先合并再聚合
-            var baseQuery = BuildDirectParquetQuery(filePaths, whereClause);
-            return $"SELECT {aggregateFunction} FROM ({baseQuery}) AS combined_data";
-        }
+        return sql;
     }
 
     /// <summary>
-    /// 构建直接的Parquet分页查询
+    /// 构建直接的Parquet分页查询，使用列表语法
     /// </summary>
     private string BuildDirectParquetPagedQuery<TEntity>(
         IEnumerable<string> filePaths,
@@ -1105,14 +980,17 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         int limit,
         int offset)
     {
-        var baseQuery = BuildDirectParquetQuery(filePaths, whereClause, selectedColumns);
-        string sql = $"SELECT * FROM ({baseQuery}) AS combined_data";
-
+        // 构建基本查询
+        string baseQuery = BuildDirectParquetQuery(filePaths, whereClause, selectedColumns);
+        
+        // 添加排序
+        string sql = baseQuery;
         if (!string.IsNullOrEmpty(orderByColumn))
         {
             sql += $" ORDER BY {orderByColumn} {(ascending ? "ASC" : "DESC")}";
         }
-
+        
+        // 添加分页
         sql += $" LIMIT {limit} OFFSET {offset}";
         return sql;
     }
