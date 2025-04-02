@@ -1,4 +1,5 @@
-﻿using System.Diagnostics;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Linq.Expressions;
 using System.Reflection;
 using Abp.Dependency;
@@ -15,10 +16,36 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     private DuckDBConnection _connection;
     private readonly ILogger _logger;
     private bool _disposed = false;
+    private DuckDBConfiguration _configuration;
+
+    // 添加预编译语句缓存
+    private readonly ConcurrentDictionary<string, PreparedStatementWrapper> _statementCache = new();
+
+    // 预编译语句包装器，用于管理预编译语句的生命周期
+    private class PreparedStatementWrapper : IDisposable
+    {
+        public DuckDBCommand Command { get; }
+        private bool _disposed = false;
+
+        public PreparedStatementWrapper(DuckDBCommand command)
+        {
+            Command = command;
+        }
+
+        public void Dispose()
+        {
+            if (!_disposed)
+            {
+                Command?.Dispose();
+                _disposed = true;
+            }
+        }
+    }
 
     public DuckDBFileQueryProvider(ILogger logger)
     {
         _logger = logger ?? NullLogger.Instance;
+        _configuration = DuckDBConfiguration.Default; // 使用默认配置
     }
 
     /// <summary>
@@ -26,23 +53,55 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     /// </summary>
     public void Initialize(string connectionString)
     {
+        var config = new DuckDBConfiguration { ConnectionString = connectionString };
+        Initialize(config);
+    }
+        
+    /// <summary>
+    /// 使用配置初始化DuckDB查询提供程序
+    /// </summary>
+    public void Initialize(DuckDBConfiguration configuration)
+    {
         try
         {
-            // 使用内存模式
-            _connection = new DuckDBConnection("Data Source=:memory:");
+            if (configuration == null)
+            {
+                throw new ArgumentNullException(nameof(configuration));
+            }
+                
+            _configuration = configuration;
+                
+            // 应用配置到缓存系统
+            DuckDBMetadataCache.ApplyConfiguration(configuration);
+                
+            // 使用配置的连接字符串
+            _connection = new DuckDBConnection(configuration.ConnectionString);
             _connection.Open();
-
-            // 设置并行线程数（根据可用处理器核心数）
-            int processorCount = Environment.ProcessorCount;
-            int threads = Math.Max(2, Math.Min(processorCount - 1, 8)); // 使用2-8个线程
 
             using (var cmd = _connection.CreateCommand())
             {
-                cmd.CommandText = $"PRAGMA threads={threads};";
+                // 设置线程数
+                cmd.CommandText = $"PRAGMA threads={configuration.ThreadCount};";
                 cmd.ExecuteNonQuery();
+
+                // 内存管理配置
+                if (!string.IsNullOrEmpty(configuration.MemoryLimit))
+                {
+                    cmd.CommandText = $"PRAGMA memory_limit='{configuration.MemoryLimit}';";
+                    cmd.ExecuteNonQuery();
+                }
+
+                // 压缩配置
+                if (configuration.EnableCompression)
+                {
+                    cmd.CommandText = $"PRAGMA force_compression='{configuration.CompressionType}';";
+                    cmd.ExecuteNonQuery();
+                }
+                    
+                // 其他PRAGMA配置...
             }
 
-            _logger.Info($"DuckDB查询提供程序初始化成功，线程数：{threads}");
+            _logger.Info($"DuckDB查询提供程序初始化成功，线程数：{configuration.ThreadCount}，内存限制：{configuration.MemoryLimit}");
         }
         catch (Exception ex)
         {
@@ -52,9 +111,93 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     }
 
     /// <summary>
+    /// 获取或创建预编译语句
+    /// </summary>
+    private PreparedStatementWrapper GetOrCreatePreparedStatement(string sql, bool forceCreate = false)
+    {
+        // 如果强制创建新实例，则不使用缓存
+        if (forceCreate || !_configuration.EnableCache)
+        {
+            var command = _connection.CreateCommand();
+            command.CommandText = sql;
+                
+            // 设置命令超时
+            if (_configuration.CommandTimeout != TimeSpan.Zero)
+            {
+                command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+            }
+                
+            try
+            {
+                command.Prepare(); // 预编译语句
+            }
+            catch (Exception ex)
+            {
+                _logger.Warn($"预编译语句失败 (非致命): {ex.Message}");
+                // 继续使用未预编译的命令
+            }
+
+            return new PreparedStatementWrapper(command);
+        }
+
+        // 从缓存获取或创建
+        return _statementCache.GetOrAdd(sql, key =>
+        {
+            try
+            {
+                var command = _connection.CreateCommand();
+                command.CommandText = key;
+                    
+                // 设置命令超时
+                if (_configuration.CommandTimeout != TimeSpan.Zero)
+                {
+                    command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                }
+                    
+                try
+                {
+                    command.Prepare(); // 预编译语句
+                }
+                catch (Exception ex)
+                {
+                    _logger.Warn($"预编译语句失败 (非致命): {ex.Message}");
+                    // 继续使用未预编译的命令
+                }
+
+                return new PreparedStatementWrapper(command);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"创建预编译语句失败: {ex.Message}, SQL: {key}", ex);
+                throw;
+            }
+        });
+    }
+
+    /// <summary>
+    /// 阶段一优化：添加查询分析功能
+    /// </summary>
+    public async Task<string> AnalyzeQueryPlanAsync(string sql)
+    {
+        using var command = _connection.CreateCommand();
+        command.CommandText = $"EXPLAIN {sql}";
+            
+        if (_configuration.LogQueryPlans)
+        {
+            var plan = (string)await command.ExecuteScalarAsync();
+            _logger.Debug($"查询计划: {plan}");
+            return plan;
+        }
+            
+        return (string)await command.ExecuteScalarAsync();
+    }
+
+    /// <summary>
     /// 查询特定类型的存档数据
     /// </summary>
-    public async Task<List<TEntity>> QueryAsync<TEntity>(IEnumerable<string> filePaths, Expression<Func<TEntity, bool>> predicate = null)
+    public async Task<List<TEntity>> QueryAsync<TEntity>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, bool>> predicate = null)
     {
         ValidateFilePaths(filePaths);
 
@@ -63,8 +206,8 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
             // 获取实体类型的属性信息，用于列投影（使用缓存）
             var selectedColumns = GetEntityColumns<TEntity>();
 
-            // 直接查询文件，不使用参数化查询，添加列投影
-            var sql = BuildDirectParquetQuery<TEntity>(filePaths, predicate, selectedColumns);
+            // 使用优化后的SQL表达式访问器
+            string sql = BuildDirectParquetQuery<TEntity>(filePaths, predicate, selectedColumns);
 
             return await ExecuteQueryWithMetricsAsync(
                 async () =>
@@ -80,6 +223,20 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         catch (Exception ex)
         {
             _logger.Error($"查询DuckDB数据失败: {ex.Message}", ex);
+                
+            // 记录查询失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "Query", 
+                    $"查询失败: {ex.Message}", 
+                    filePaths.Count(), 
+                    0,
+                    0,
+                    false,
+                    ex);
+            }
+                
             throw;
         }
     }
@@ -98,22 +255,32 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
 
         if (batchSize <= 0)
             throw new ArgumentException("批处理大小必须大于0", nameof(batchSize));
+            
+        // 使用配置的批处理大小限制
+        batchSize = Math.Min(batchSize, _configuration.MaxBatchSize);
 
         try
         {
             // 获取实体类型的属性信息，用于列投影（使用缓存）
             var selectedColumns = GetEntityColumns<TEntity>();
 
-            // 直接查询文件，不使用参数化查询，添加列投影
-            var sql = BuildDirectParquetQuery<TEntity>(filePaths, predicate, selectedColumns);
+            // 使用优化后的SQL表达式访问器
+            string sql = BuildDirectParquetQuery<TEntity>(filePaths, predicate, selectedColumns);
 
             var stopwatch = Stopwatch.StartNew();
             int totalProcessed = 0;
 
             using var command = _connection.CreateCommand();
             command.CommandText = sql;
+
             // 开启流式模式
-            command.UseStreamingMode = true;
+            command.UseStreamingMode = _configuration.UseStreamingModeByDefault;
+                
+            // 设置命令超时
+            if (_configuration.CommandTimeout != TimeSpan.Zero)
+            {
+                command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+            }
 
             using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
 
@@ -156,10 +323,28 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
             }
 
             stopwatch.Stop();
+                
+            // 记录性能指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "QueryStream",
+                    sql,
+                    filePaths.Count(),
+                    totalProcessed,
+                    stopwatch.ElapsedMilliseconds,
+                    true);
+                    
+                // 检查是否是慢查询
+                if (_configuration.LogSlowQueries && stopwatch.ElapsedMilliseconds > _configuration.SlowQueryThresholdMs)
+                {
+                    _logger.Warn($"[慢查询] 流式查询耗时: {stopwatch.ElapsedMilliseconds}ms, SQL: {sql}");
+                }
+            }
 
             _logger.Info($"[DuckDB流式处理] 文件数: {filePaths.Count()} | " +
-                $"总记录数: {totalProcessed} | 批大小: {batchSize} | " +
-                $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                         $"总记录数: {totalProcessed} | 批大小: {batchSize} | " +
+                         $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             _logger.Debug($"[DuckDB流式SQL] {sql}");
 
@@ -168,6 +353,20 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         catch (Exception ex)
         {
             _logger.Error($"流式查询DuckDB数据失败: {ex.Message}", ex);
+                
+            // 记录查询失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "QueryStream",
+                    $"流式查询失败: {ex.Message}",
+                    filePaths.Count(),
+                    0,
+                    0,
+                    false,
+                    ex);
+            }
+                
             throw;
         }
     }
@@ -180,18 +379,21 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         Expression<Func<TEntity, bool>> predicate = null,
         int batchSize = 1000,
         [System.Runtime.CompilerServices.EnumeratorCancellation]
-            CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default)
     {
         ValidateFilePaths(filePaths);
 
         if (batchSize <= 0)
             throw new ArgumentException("批处理大小必须大于0", nameof(batchSize));
+            
+        // 使用配置的批处理大小限制
+        batchSize = Math.Min(batchSize, _configuration.MaxBatchSize);
 
         // 获取实体类型的属性信息，用于列投影（使用缓存）
         var selectedColumns = GetEntityColumns<TEntity>();
 
-        // 直接查询文件，不使用参数化查询，添加列投影
-        var sql = BuildDirectParquetQuery<TEntity>(filePaths, predicate, selectedColumns);
+        // 使用优化后的SQL表达式访问器
+        string sql = BuildDirectParquetQuery<TEntity>(filePaths, predicate, selectedColumns);
 
         var stopwatch = Stopwatch.StartNew();
         int processedCount = 0;
@@ -200,8 +402,15 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         {
             using var command = _connection.CreateCommand();
             command.CommandText = sql;
+
             // 开启流式模式
-            command.UseStreamingMode = true;
+            command.UseStreamingMode = _configuration.UseStreamingModeByDefault;
+                
+            // 设置命令超时
+            if (_configuration.CommandTimeout != TimeSpan.Zero)
+            {
+                command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+            }
 
             using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
 
@@ -225,7 +434,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
                 yield return entity;
 
                 // 每读取 batchSize 条记录记录一次指标
-                if (processedCount % batchSize == 0)
+                if (processedCount % batchSize == 0 && _configuration.CollectDetailedMetrics)
                 {
                     _logger.Debug($"[DuckDB流式进度] 已处理记录: {processedCount}");
                 }
@@ -234,9 +443,28 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         finally
         {
             stopwatch.Stop();
+                
+            // 记录性能指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "QueryStreamEnumerable",
+                    sql,
+                    filePaths.Count(),
+                    processedCount,
+                    stopwatch.ElapsedMilliseconds,
+                    true);
+                    
+                // 检查是否是慢查询
+                if (_configuration.LogSlowQueries && stopwatch.ElapsedMilliseconds > _configuration.SlowQueryThresholdMs)
+                {
+                    _logger.Warn($"[慢查询] 流式枚举查询耗时: {stopwatch.ElapsedMilliseconds}ms, SQL: {sql}");
+                }
+            }
+                
             _logger.Info($"[DuckDB流式枚举] 文件数: {filePaths.Count()} | " +
-                $"总记录数: {processedCount} | " +
-                $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                         $"总记录数: {processedCount} | " +
+                         $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             _logger.Debug($"[DuckDB流式SQL] {sql}");
         }
@@ -259,16 +487,15 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
 
         try
         {
-            // 获取实体类型的属性信息，用于列投影（使用缓存）
+            // 获取实体类型的属性信息，用于列投影
             var selectedColumns = GetEntityColumns<TEntity>();
 
-            // 构建所有查询的组合脚本
+            // 构建所有查询的SQL
             var queryScripts = new List<string>();
             foreach (var entry in predicatesMap)
             {
-                string whereClause = entry.Value != null ? TranslateExpressionToSql(entry.Value) : "";
-                string querySql = BuildDirectParquetQuery(filePaths, whereClause, selectedColumns);
-                queryScripts.Add(querySql);
+                string sql = BuildDirectParquetQuery<TEntity>(filePaths, entry.Value, selectedColumns);
+                queryScripts.Add(sql);
             }
 
             // 批量执行所有查询
@@ -284,10 +511,24 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
                     results[key] = new List<TEntity>();
                 index++;
             }
-
+                
             stopwatch.Stop();
+                
+            // 记录性能指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                int totalResults = results.Values.Sum(v => v.Count);
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "BatchQuery",
+                    string.Join("; ", queryScripts),
+                    filePaths.Count(),
+                    totalResults,
+                    stopwatch.ElapsedMilliseconds,
+                    true);
+            }
+                
             _logger.Info($"[DuckDB批处理指标] 批量查询 | 文件数: {filePaths.Count()} | " +
-                $"查询数: {predicatesMap.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                         $"查询数: {predicatesMap.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             return results;
         }
@@ -295,6 +536,20 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         {
             stopwatch.Stop();
             _logger.Error($"批量查询DuckDB数据失败: {ex.Message}", ex);
+                
+            // 记录失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "BatchQuery",
+                    "批量查询失败",
+                    filePaths.Count(),
+                    0,
+                    stopwatch.ElapsedMilliseconds,
+                    false,
+                    ex);
+            }
+                
             throw;
         }
     }
@@ -307,6 +562,8 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         var results = new List<List<TEntity>>();
         if (!sqlQueries.Any()) return results;
 
+        var stopwatch = Stopwatch.StartNew();
+            
         // 使用事务来优化批处理
         using var transaction = _connection.BeginTransaction();
         try
@@ -316,18 +573,37 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
                 using var command = _connection.CreateCommand();
                 command.CommandText = sql;
                 command.Transaction = transaction;
+                    
+                // 设置命令超时
+                if (_configuration.CommandTimeout != TimeSpan.Zero)
+                {
+                    command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                }
 
                 var queryResult = await ExecuteReaderAsync<TEntity>(command).ConfigureAwait(false);
                 results.Add(queryResult);
             }
 
             transaction.Commit();
+                
+            stopwatch.Stop();
+                
+            // 记录详细指标
+            if (_configuration.CollectDetailedMetrics)
+            {
+                _logger.Debug($"[DuckDB批处理详情] 执行了 {sqlQueries.Count} 个查询, " +
+                              $"共返回 {results.Sum(r => r.Count)} 条记录, " +
+                              $"耗时: {stopwatch.ElapsedMilliseconds}ms");
+            }
+                
             return results;
         }
         catch (Exception ex)
         {
+            stopwatch.Stop();
             transaction.Rollback();
             _logger.Error($"批量执行查询失败: {ex.Message}", ex);
+                
             throw;
         }
     }
@@ -345,7 +621,6 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         if (metricsMap == null || !metricsMap.Any())
             throw new ArgumentException("必须提供至少一个指标", nameof(metricsMap));
 
-        string whereClause = predicate != null ? TranslateExpressionToSql(predicate) : "";
         var stopwatch = Stopwatch.StartNew();
 
         try
@@ -354,8 +629,19 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
             var aggregations = string.Join(", ",
                 metricsMap.Select(m => $"{m.Value} AS {m.Key}"));
 
-            // 构建查询
-            string sql = $"SELECT {aggregations} FROM {BuildParquetSourceClause(filePaths)}";
+            // 使用优化后的SQL表达式访问器
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建数据源子句
+            string fromClause = BuildParquetSourceClause(filePaths);
+
+            // 构建完整SQL
+            string sql = $"SELECT {aggregations} FROM {fromClause}";
             if (!string.IsNullOrEmpty(whereClause))
                 sql += $" WHERE {whereClause}";
 
@@ -364,6 +650,12 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
 
             using var command = _connection.CreateCommand();
             command.CommandText = sql;
+                
+            // 设置命令超时
+            if (_configuration.CommandTimeout != TimeSpan.Zero)
+            {
+                command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+            }
 
             using var reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
 
@@ -377,8 +669,21 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
             }
 
             stopwatch.Stop();
+                
+            // 记录性能指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "MultipleMetrics",
+                    sql,
+                    filePaths.Count(),
+                    result.Count,
+                    stopwatch.ElapsedMilliseconds,
+                    true);
+            }
+                
             _logger.Info($"[DuckDB批处理指标] 多指标查询 | 文件数: {filePaths.Count()} | " +
-                $"指标数: {metricsMap.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                         $"指标数: {metricsMap.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             _logger.Debug($"[DuckDB指标SQL] {sql}");
 
@@ -388,6 +693,20 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         {
             stopwatch.Stop();
             _logger.Error($"获取多个指标失败: {ex.Message}", ex);
+                
+            // 记录失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "MultipleMetrics",
+                    "多指标查询失败",
+                    filePaths.Count(),
+                    0,
+                    stopwatch.ElapsedMilliseconds,
+                    false,
+                    ex);
+            }
+                
             throw;
         }
     }
@@ -412,7 +731,13 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
 
         try
         {
-            string whereClause = predicate != null ? TranslateExpressionToSql(predicate) : "";
+            // 使用优化后的SQL表达式访问器
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
 
             // 使用批处理同时获取总数和分页数据
             var queries = new List<string>();
@@ -446,6 +771,13 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
                 {
                     countCommand.CommandText = countSql;
                     countCommand.Transaction = transaction;
+                        
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        countCommand.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+                        
                     totalCount = Convert.ToInt32(await countCommand.ExecuteScalarAsync());
                 }
 
@@ -456,6 +788,13 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
                     {
                         pageCommand.CommandText = pagingSql;
                         pageCommand.Transaction = transaction;
+                            
+                        // 设置命令超时
+                        if (_configuration.CommandTimeout != TimeSpan.Zero)
+                        {
+                            pageCommand.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                        }
+                            
                         items = await ExecuteReaderAsync<TEntity>(pageCommand);
                     }
                 }
@@ -464,14 +803,47 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
             }
 
             stopwatch.Stop();
+                
+            // 记录性能指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "QueryPaged",
+                    $"Count: {countSql}; Page: {pagingSql}",
+                    filePaths.Count(),
+                    items.Count,
+                    stopwatch.ElapsedMilliseconds,
+                    true);
+                    
+                // 检查是否是慢查询
+                if (_configuration.LogSlowQueries && stopwatch.ElapsedMilliseconds > _configuration.SlowQueryThresholdMs)
+                {
+                    _logger.Warn($"[慢查询] 分页查询耗时: {stopwatch.ElapsedMilliseconds}ms, 页码: {pageIndex}, 页大小: {pageSize}");
+                }
+            }
+                
             _logger.Info($"[DuckDB批处理指标] 分页查询 | 文件数: {filePaths.Count()} | " +
-                $"总数: {totalCount} | 页数据: {items.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                         $"总数: {totalCount} | 页数据: {items.Count} | 执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             return (items, totalCount);
         }
         catch (Exception ex)
         {
             _logger.Error($"分页查询DuckDB数据失败: {ex.Message}", ex);
+                
+            // 记录失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "QueryPaged",
+                    "分页查询失败",
+                    filePaths.Count(),
+                    0,
+                    0,
+                    false,
+                    ex);
+            }
+                
             throw;
         }
     }
@@ -485,7 +857,15 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
 
         try
         {
-            string whereClause = predicate != null ? TranslateExpressionToSql(predicate) : "";
+            // 使用优化后的SQL表达式访问器
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建计数查询
             string countSql = BuildDirectParquetCountQuery(filePaths, whereClause);
 
             return await ExecuteQueryWithMetricsAsync(
@@ -493,6 +873,13 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
                 {
                     using var command = _connection.CreateCommand();
                     command.CommandText = countSql;
+                        
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+                        
                     return Convert.ToInt32(await command.ExecuteScalarAsync());
                 },
                 "Count",
@@ -502,6 +889,20 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         catch (Exception ex)
         {
             _logger.Error($"统计DuckDB数据失败: {ex.Message}", ex);
+                
+            // 记录失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "Count",
+                    "统计查询失败",
+                    filePaths.Count(),
+                    0,
+                    0,
+                    false,
+                    ex);
+            }
+                
             throw;
         }
     }
@@ -509,7 +910,10 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     /// <summary>
     /// 获取特定列的合计值
     /// </summary>
-    public async Task<decimal> SumAsync<TEntity>(IEnumerable<string> filePaths, Expression<Func<TEntity, decimal>> selector, Expression<Func<TEntity, bool>> predicate = null)
+    public async Task<decimal> SumAsync<TEntity>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, decimal>> selector,
+        Expression<Func<TEntity, bool>> predicate = null)
     {
         ValidateFilePaths(filePaths);
 
@@ -520,9 +924,16 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         {
             // 获取待求和的属性名
             string columnName = GetColumnName(selector);
-            string whereClause = predicate != null ? TranslateExpressionToSql(predicate) : "";
 
-            // 构建直接查询
+            // 使用优化后的SQL表达式访问器
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建聚合查询
             string sql = BuildDirectParquetAggregateQuery(filePaths, $"SUM({columnName})", whereClause);
 
             return await ExecuteQueryWithMetricsAsync(
@@ -530,6 +941,13 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
                 {
                     using var command = _connection.CreateCommand();
                     command.CommandText = sql;
+                        
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+                        
                     var result = await command.ExecuteScalarAsync();
 
                     if (result == null || result == DBNull.Value)
@@ -544,6 +962,20 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         catch (Exception ex)
         {
             _logger.Error($"求和DuckDB数据失败: {ex.Message}", ex);
+                
+            // 记录失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "Sum",
+                    "求和查询失败",
+                    filePaths.Count(),
+                    0,
+                    0,
+                    false,
+                    ex);
+            }
+                
             throw;
         }
     }
@@ -551,7 +983,10 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     /// <summary>
     /// 获取特定列的平均值
     /// </summary>
-    public async Task<decimal> AvgAsync<TEntity>(IEnumerable<string> filePaths, Expression<Func<TEntity, decimal>> selector, Expression<Func<TEntity, bool>> predicate = null)
+    public async Task<decimal> AvgAsync<TEntity>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, decimal>> selector,
+        Expression<Func<TEntity, bool>> predicate = null)
     {
         ValidateFilePaths(filePaths);
 
@@ -562,9 +997,16 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         {
             // 获取待求平均值的属性名
             string columnName = GetColumnName(selector);
-            string whereClause = predicate != null ? TranslateExpressionToSql(predicate) : "";
 
-            // 构建直接查询
+            // 使用优化后的SQL表达式访问器
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建聚合查询
             string sql = BuildDirectParquetAggregateQuery(filePaths, $"AVG({columnName})", whereClause);
 
             return await ExecuteQueryWithMetricsAsync(
@@ -572,6 +1014,13 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
                 {
                     using var command = _connection.CreateCommand();
                     command.CommandText = sql;
+                        
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+                        
                     var result = await command.ExecuteScalarAsync();
 
                     if (result == null || result == DBNull.Value)
@@ -586,6 +1035,20 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         catch (Exception ex)
         {
             _logger.Error($"求平均值DuckDB数据失败: {ex.Message}", ex);
+                
+            // 记录失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "Avg",
+                    "求平均值查询失败",
+                    filePaths.Count(),
+                    0,
+                    0,
+                    false,
+                    ex);
+            }
+                
             throw;
         }
     }
@@ -593,7 +1056,10 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     /// <summary>
     /// 获取特定列的最小值
     /// </summary>
-    public async Task<decimal> MinAsync<TEntity>(IEnumerable<string> filePaths, Expression<Func<TEntity, decimal>> selector, Expression<Func<TEntity, bool>> predicate = null)
+    public async Task<decimal> MinAsync<TEntity>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, decimal>> selector,
+        Expression<Func<TEntity, bool>> predicate = null)
     {
         ValidateFilePaths(filePaths);
 
@@ -604,9 +1070,16 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         {
             // 获取待求最小值的属性名
             string columnName = GetColumnName(selector);
-            string whereClause = predicate != null ? TranslateExpressionToSql(predicate) : "";
 
-            // 构建直接查询
+            // 使用优化后的SQL表达式访问器
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建聚合查询
             string sql = BuildDirectParquetAggregateQuery(filePaths, $"MIN({columnName})", whereClause);
 
             return await ExecuteQueryWithMetricsAsync(
@@ -614,6 +1087,13 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
                 {
                     using var command = _connection.CreateCommand();
                     command.CommandText = sql;
+                        
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+                        
                     var result = await command.ExecuteScalarAsync();
 
                     if (result == null || result == DBNull.Value)
@@ -628,6 +1108,20 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         catch (Exception ex)
         {
             _logger.Error($"求最小值DuckDB数据失败: {ex.Message}", ex);
+                
+            // 记录失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "Min",
+                    "求最小值查询失败",
+                    filePaths.Count(),
+                    0,
+                    0,
+                    false,
+                    ex);
+            }
+                
             throw;
         }
     }
@@ -635,7 +1129,10 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     /// <summary>
     /// 获取特定列的最大值
     /// </summary>
-    public async Task<decimal> MaxAsync<TEntity>(IEnumerable<string> filePaths, Expression<Func<TEntity, decimal>> selector, Expression<Func<TEntity, bool>> predicate = null)
+    public async Task<decimal> MaxAsync<TEntity>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, decimal>> selector,
+        Expression<Func<TEntity, bool>> predicate = null)
     {
         ValidateFilePaths(filePaths);
 
@@ -646,9 +1143,16 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         {
             // 获取待求最大值的属性名
             string columnName = GetColumnName(selector);
-            string whereClause = predicate != null ? TranslateExpressionToSql(predicate) : "";
 
-            // 构建直接查询
+            // 使用优化后的SQL表达式访问器
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建聚合查询
             string sql = BuildDirectParquetAggregateQuery(filePaths, $"MAX({columnName})", whereClause);
 
             return await ExecuteQueryWithMetricsAsync(
@@ -656,6 +1160,13 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
                 {
                     using var command = _connection.CreateCommand();
                     command.CommandText = sql;
+                        
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+                        
                     var result = await command.ExecuteScalarAsync();
 
                     if (result == null || result == DBNull.Value)
@@ -670,6 +1181,20 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         catch (Exception ex)
         {
             _logger.Error($"求最大值DuckDB数据失败: {ex.Message}", ex);
+                
+            // 记录失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "Max",
+                    "求最大值查询失败",
+                    filePaths.Count(),
+                    0,
+                    0,
+                    false,
+                    ex);
+            }
+                
             throw;
         }
     }
@@ -689,6 +1214,12 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
                 {
                     using var command = _connection.CreateCommand();
                     command.CommandText = sql;
+                        
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
 
                     if (parameters != null && parameters.Length > 0)
                     {
@@ -712,8 +1243,159 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         catch (Exception ex)
         {
             _logger.Error($"执行自定义SQL查询失败: {ex.Message}，SQL语句：{sql}", ex);
+                
+            // 记录失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    "RawSql",
+                    sql,
+                    0,
+                    0,
+                    0,
+                    false,
+                    ex);
+            }
+                
             throw new Exception($"执行自定义SQL查询失败", ex);
         }
+    }
+
+    /// <summary>
+    /// 获取性能报告
+    /// </summary>
+    public QueryPerformanceMonitor.PerformanceReport GetPerformanceReport()
+    {
+        return QueryPerformanceMonitor.GenerateReport();
+    }
+
+    /// <summary>
+    /// 获取查询类型的性能指标
+    /// </summary>
+    public QueryPerformanceMonitor.QueryMetrics GetMetricsForQueryType(string queryType)
+    {
+        return QueryPerformanceMonitor.GetMetricsForQueryType(queryType);
+    }
+
+    /// <summary>
+    /// 重置性能指标
+    /// </summary>
+    public void ResetPerformanceMetrics()
+    {
+        QueryPerformanceMonitor.ResetMetrics();
+    }
+
+    /// <summary>
+    /// 直接构建查询SQL，不使用参数化
+    /// </summary>
+    private string BuildDirectParquetQuery<TEntity>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, bool>> predicate = null,
+        IEnumerable<string> selectedColumns = null)
+    {
+        string whereClause = string.Empty;
+        if (predicate != null)
+        {
+            var visitor = new SqlExpressionVisitor(_logger);
+            whereClause = visitor.Translate(predicate);
+        }
+
+        return BuildDirectParquetQuery(filePaths, whereClause, selectedColumns);
+    }
+
+    /// <summary>
+    /// 构建直接的Parquet查询，使用列表语法
+    /// </summary>
+    private string BuildDirectParquetQuery(
+        IEnumerable<string> filePaths,
+        string whereClause,
+        IEnumerable<string> selectedColumns = null)
+    {
+        // 确定查询的列
+        string columns = "*";
+        if (selectedColumns != null && selectedColumns.Any())
+        {
+            columns = string.Join(", ", selectedColumns);
+        }
+
+        // 使用列表语法
+        string sql = $"SELECT {columns} FROM {BuildParquetSourceClause(filePaths)}";
+
+        // 添加WHERE子句（如果有）
+        if (!string.IsNullOrEmpty(whereClause))
+        {
+            sql += $" WHERE {whereClause}";
+        }
+
+        return sql;
+    }
+
+    /// <summary>
+    /// 构建直接的Parquet计数查询
+    /// </summary>
+    private string BuildDirectParquetCountQuery(IEnumerable<string> filePaths, string whereClause)
+    {
+        string sql = $"SELECT COUNT(*) FROM {BuildParquetSourceClause(filePaths)}";
+
+        // 添加WHERE子句（如果有）
+        if (!string.IsNullOrEmpty(whereClause))
+        {
+            sql += $" WHERE {whereClause}";
+        }
+
+        return sql;
+    }
+
+    /// <summary>
+    /// 构建直接的Parquet聚合查询
+    /// </summary>
+    private string BuildDirectParquetAggregateQuery(
+        IEnumerable<string> filePaths,
+        string aggregateFunction,
+        string whereClause)
+    {
+        string sql = $"SELECT {aggregateFunction} FROM {BuildParquetSourceClause(filePaths)}";
+
+        // 添加WHERE子句（如果有）
+        if (!string.IsNullOrEmpty(whereClause))
+        {
+            sql += $" WHERE {whereClause}";
+        }
+
+        return sql;
+    }
+
+    /// <summary>
+    /// 构建直接的Parquet分页查询
+    /// </summary>
+    private string BuildDirectParquetPagedQuery<TEntity>(
+        IEnumerable<string> filePaths,
+        string whereClause,
+        IEnumerable<string> selectedColumns,
+        string orderByColumn,
+        bool ascending,
+        int limit,
+        int offset)
+    {
+        // 构建基本查询
+        string sql = BuildDirectParquetQuery(filePaths, whereClause, selectedColumns);
+
+        // 添加排序
+        if (!string.IsNullOrEmpty(orderByColumn))
+        {
+            sql += $" ORDER BY {orderByColumn} {(ascending ? "ASC" : "DESC")}";
+        }
+
+        // 添加分页
+        sql += $" LIMIT {limit} OFFSET {offset}";
+        return sql;
+    }
+
+    private string BuildParquetSourceClause(IEnumerable<string> filePaths)
+    {
+        var escapedPaths = filePaths.Select(p => $"'{p.Replace("'", "''")}'");
+        string pathList = string.Join(", ", escapedPaths);
+        return $"read_parquet([{pathList}])";
     }
 
     /// <summary>
@@ -726,6 +1408,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         int filesCount)
     {
         var stopwatch = Stopwatch.StartNew();
+        int resultCount = -1;
 
         try
         {
@@ -733,16 +1416,35 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
             stopwatch.Stop();
 
             // 计算结果集大小（如果可能）
-            int resultCount = -1;
             if (result is ICollection<object> collection)
                 resultCount = collection.Count;
             else if (result is int intValue)
                 resultCount = 1;
+            else if (result is IEnumerable<object> enumerable)
+                resultCount = enumerable.Count();
+                
+            // 收集性能指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    queryType, 
+                    sql, 
+                    filesCount, 
+                    resultCount >= 0 ? resultCount : 0, 
+                    stopwatch.ElapsedMilliseconds,
+                    true);
+                    
+                // 检查是否是慢查询
+                if (_configuration.LogSlowQueries && stopwatch.ElapsedMilliseconds > _configuration.SlowQueryThresholdMs)
+                {
+                    _logger.Warn($"[慢查询] {queryType}查询耗时: {stopwatch.ElapsedMilliseconds}ms, SQL: {sql}");
+                }
+            }
 
             // 记录基本指标
             _logger.Info($"[DuckDB指标] 类型: {queryType} | 文件数: {filesCount} | " +
-                $"结果数: {(resultCount >= 0 ? resultCount.ToString() : "N/A")} | " +
-                $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                         $"结果数: {(resultCount >= 0 ? resultCount.ToString() : "N/A")} | " +
+                         $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
 
             _logger.Debug($"[DuckDB指标SQL] {sql}");
 
@@ -751,10 +1453,126 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         catch (Exception ex)
         {
             stopwatch.Stop();
+                
+            // 收集失败指标
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                QueryPerformanceMonitor.RecordQueryExecution(
+                    queryType, 
+                    sql, 
+                    filesCount, 
+                    0, 
+                    stopwatch.ElapsedMilliseconds,
+                    false,
+                    ex);
+            }
+                
             _logger.Error($"[DuckDB指标错误] 类型: {queryType} | 文件数: {filesCount} | " +
-                $"执行时间: {stopwatch.ElapsedMilliseconds}ms | 错误: {ex.Message}");
+                          $"执行时间: {stopwatch.ElapsedMilliseconds}ms | 错误: {ex.Message}");
+                
+            // 自动重试功能
+            if (_configuration.AutoRetryFailedQueries && IsRetryableException(ex))
+            {
+                return await RetryOperationAsync(queryFunc, queryType, sql, filesCount);
+            }
+                
             throw;
         }
+    }
+        
+    /// <summary>
+    /// 判断异常是否可以重试
+    /// </summary>
+    private bool IsRetryableException(Exception ex)
+    {
+        // 识别可以重试的异常类型
+        return ex is DuckDBException duckEx &&
+               (duckEx.Message.Contains("timeout") || 
+                duckEx.Message.Contains("connection") ||
+                duckEx.Message.Contains("temporary"));
+    }
+        
+    /// <summary>
+    /// 重试操作
+    /// </summary>
+    private async Task<T> RetryOperationAsync<T>(
+        Func<Task<T>> operation,
+        string queryType,
+        string sql,
+        int filesCount)
+    {
+        int retryCount = 0;
+        Exception lastException = null;
+            
+        while (retryCount < _configuration.MaxRetryCount)
+        {
+            retryCount++;
+                
+            try
+            {
+                // 等待一段时间后重试
+                await Task.Delay(TimeSpan.FromMilliseconds(
+                    _configuration.RetryInterval.TotalMilliseconds * Math.Pow(2, retryCount - 1))); // 指数退避
+                    
+                _logger.Warn($"[DuckDB重试] 查询类型: {queryType} | 第 {retryCount} 次重试...");
+                    
+                var stopwatch = Stopwatch.StartNew();
+                T result = await operation();
+                stopwatch.Stop();
+                    
+                _logger.Info($"[DuckDB重试成功] 查询类型: {queryType} | 重试次数: {retryCount} | " +
+                             $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
+                    
+                // 记录重试成功指标
+                if (_configuration.EnablePerformanceMonitoring)
+                {
+                    int resultCount = -1;
+                    if (result is ICollection<object> collection)
+                        resultCount = collection.Count;
+                    else if (result is int intValue)
+                        resultCount = 1;
+                        
+                    QueryPerformanceMonitor.RecordQueryExecution(
+                        $"{queryType}Retry", 
+                        sql, 
+                        filesCount, 
+                        resultCount >= 0 ? resultCount : 0, 
+                        stopwatch.ElapsedMilliseconds,
+                        true);
+                }
+                    
+                return result;
+            }
+            catch (Exception ex)
+            {
+                lastException = ex;
+                _logger.Warn($"[DuckDB重试失败] 查询类型: {queryType} | 重试次数: {retryCount} | 错误: {ex.Message}");
+                    
+                // 记录重试失败指标
+                if (_configuration.EnablePerformanceMonitoring)
+                {
+                    QueryPerformanceMonitor.RecordQueryExecution(
+                        $"{queryType}RetryFailed", 
+                        sql, 
+                        filesCount, 
+                        0, 
+                        0,
+                        false,
+                        ex);
+                }
+                    
+                // 如果不是可重试异常，则中断重试
+                if (!IsRetryableException(ex))
+                {
+                    _logger.Error($"[DuckDB重试终止] 查询类型: {queryType} | 遇到不可重试的异常");
+                    break;
+                }
+            }
+        }
+            
+        // 所有重试都失败
+        _logger.Error($"[DuckDB重试耗尽] 查询类型: {queryType} | 已达到最大重试次数: {_configuration.MaxRetryCount}");
+        throw new Exception($"执行查询失败，已重试 {retryCount} 次", lastException);
     }
 
     #region Helper Methods
@@ -884,117 +1702,6 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         });
     }
 
-    /// <summary>
-    /// 构建Parquet数据源子句，使用列表语法
-    /// </summary>
-    private string BuildParquetSourceClause(IEnumerable<string> filePaths)
-    {
-        var escapedPaths = filePaths.Select(p => $"'{p.Replace("'", "''")}'");
-        string pathList = string.Join(", ", escapedPaths);
-        return $"read_parquet([{pathList}])";
-    }
-
-    /// <summary>
-    /// 直接构建查询SQL，使用列表语法
-    /// </summary>
-    private string BuildDirectParquetQuery<TEntity>(
-        IEnumerable<string> filePaths,
-        Expression<Func<TEntity, bool>> predicate = null,
-        IEnumerable<string> selectedColumns = null)
-    {
-        string whereClause = predicate != null ? TranslateExpressionToSql(predicate) : "";
-        return BuildDirectParquetQuery(filePaths, whereClause, selectedColumns);
-    }
-
-    /// <summary>
-    /// 构建直接的Parquet查询，使用列表语法
-    /// </summary>
-    private string BuildDirectParquetQuery(
-        IEnumerable<string> filePaths,
-        string whereClause,
-        IEnumerable<string> selectedColumns = null)
-    {
-        // 确定查询的列
-        string columns = "*";
-        if (selectedColumns != null && selectedColumns.Any())
-        {
-            columns = string.Join(", ", selectedColumns);
-        }
-
-        // 使用列表语法
-        string sql = $"SELECT {columns} FROM {BuildParquetSourceClause(filePaths)}";
-        
-        // 添加WHERE子句（如果有）
-        if (!string.IsNullOrEmpty(whereClause))
-        {
-            sql += $" WHERE {whereClause}";
-        }
-
-        return sql;
-    }
-
-    /// <summary>
-    /// 构建直接的Parquet计数查询，使用列表语法
-    /// </summary>
-    private string BuildDirectParquetCountQuery(IEnumerable<string> filePaths, string whereClause)
-    {
-        string sql = $"SELECT COUNT(*) FROM {BuildParquetSourceClause(filePaths)}";
-        
-        // 添加WHERE子句（如果有）
-        if (!string.IsNullOrEmpty(whereClause))
-        {
-            sql += $" WHERE {whereClause}";
-        }
-
-        return sql;
-    }
-
-    /// <summary>
-    /// 构建直接的Parquet聚合查询，使用列表语法
-    /// </summary>
-    private string BuildDirectParquetAggregateQuery(
-        IEnumerable<string> filePaths,
-        string aggregateFunction,
-        string whereClause)
-    {
-        string sql = $"SELECT {aggregateFunction} FROM {BuildParquetSourceClause(filePaths)}";
-        
-        // 添加WHERE子句（如果有）
-        if (!string.IsNullOrEmpty(whereClause))
-        {
-            sql += $" WHERE {whereClause}";
-        }
-
-        return sql;
-    }
-
-    /// <summary>
-    /// 构建直接的Parquet分页查询，使用列表语法
-    /// </summary>
-    private string BuildDirectParquetPagedQuery<TEntity>(
-        IEnumerable<string> filePaths,
-        string whereClause,
-        IEnumerable<string> selectedColumns,
-        string orderByColumn,
-        bool ascending,
-        int limit,
-        int offset)
-    {
-        // 构建基本查询
-        string baseQuery = BuildDirectParquetQuery(filePaths, whereClause, selectedColumns);
-        
-        // 添加排序
-        string sql = baseQuery;
-        if (!string.IsNullOrEmpty(orderByColumn))
-        {
-            sql += $" ORDER BY {orderByColumn} {(ascending ? "ASC" : "DESC")}";
-        }
-        
-        // 添加分页
-        sql += $" LIMIT {limit} OFFSET {offset}";
-        return sql;
-    }
-
     private void ValidateFilePaths(IEnumerable<string> filePaths)
     {
         if (filePaths == null || !filePaths.Any())
@@ -1009,33 +1716,6 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         }
 
         throw new ArgumentException("Selector必须是一个属性访问表达式");
-    }
-
-    /// <summary>
-    /// 将表达式转换为SQL WHERE子句（使用缓存）
-    /// </summary>
-    private string TranslateExpressionToSql<TEntity>(Expression<Func<TEntity, bool>> predicate)
-    {
-        if (predicate == null)
-            return string.Empty;
-
-        try
-        {
-            string expressionKey = predicate.ToString();
-            return DuckDBMetadataCache.GetOrAddExpressionSql(expressionKey, _ =>
-            {
-                var visitor = new SqlExpressionVisitor();
-                string sqlCondition = visitor.Translate(predicate);
-
-                _logger.Debug($"表达式 [{predicate}] 被翻译为 SQL: [{sqlCondition}]");
-                return sqlCondition;
-            });
-        }
-        catch (Exception ex)
-        {
-            _logger.Error($"无法将表达式转换为SQL: {ex.Message}", ex);
-            throw new ArgumentException($"无法将表达式 [{predicate}] 转换为SQL", nameof(predicate), ex);
-        }
     }
 
     /// <summary>
@@ -1083,6 +1763,23 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
             {
                 try
                 {
+                    // 输出性能报告（如果已启用）
+                    if (_configuration.EnablePerformanceMonitoring)
+                    {
+                        var report = QueryPerformanceMonitor.GenerateReport();
+                        _logger.Info($"DuckDB性能报告: 总查询数: {report.TotalQueries}, " +
+                                     $"成功率: {report.OverallSuccessRate:F2}%, " +
+                                     $"平均耗时: {report.AverageQueryTimeMs:F2}ms");
+                    }
+                        
+                    // 清理预编译语句缓存
+                    foreach (var statementWrapper in _statementCache.Values)
+                    {
+                        statementWrapper.Dispose();
+                    }
+
+                    _statementCache.Clear();
+
                     // 输出缓存统计
                     _logger.Info($"DuckDB元数据缓存统计: {DuckDBMetadataCache.GetStatistics()}");
 
@@ -1106,4 +1803,20 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     }
 
     #endregion
+}
+
+// 列属性特性
+public class ColumnAttribute : Attribute
+{
+    public string Name { get; }
+
+    public ColumnAttribute(string name)
+    {
+        Name = name;
+    }
+}
+
+// 未映射特性
+public class NotMappedAttribute : Attribute
+{
 }
