@@ -1,346 +1,530 @@
-﻿using System.Collections.Concurrent;
+﻿using System;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Linq;
 using System.Reflection;
 
 namespace Abp.DuckDB.FileQuery;
 
 /// <summary>
-/// DuckDB 元数据缓存，用于优化查询性能
+/// DuckDB元数据缓存管理器，使用适应性淘汰策略
 /// </summary>
 public static class DuckDBMetadataCache
 {
+    #region 缓存存储
+
+    // 类型-属性缓存
     private static readonly ConcurrentDictionary<Type, PropertyInfo[]> _propertiesCache = new();
+        
+    // 类型-列映射缓存
     private static readonly ConcurrentDictionary<Type, Dictionary<string, string>> _propertyColumnMappingsCache = new();
+        
+    // 类型-实体列名缓存
     private static readonly ConcurrentDictionary<Type, List<string>> _entityColumnsCache = new();
-    private static readonly ConcurrentDictionary<string, CacheItem<string>> _expressionSqlCache = new();
-
+        
+    // 表达式字符串-SQL缓存
+    private static readonly ConcurrentDictionary<string, string> _expressionSqlCache = new();
+        
+    // 属性访问频率统计
+    private static readonly ConcurrentDictionary<Type, CacheMetrics> _accessMetrics = new();
+        
+    // 表达式访问频率统计
+    private static readonly ConcurrentDictionary<string, ExpressionCacheMetrics> _expressionAccessMetrics = new();
+        
+    // 缓存配置
+    private static DuckDBCacheConfiguration _config = new();
+        
+    // 清理计时器
     private static Timer _cleanupTimer;
-    private static TimeSpan _defaultExpirationTime = TimeSpan.FromHours(12);
-    private static int _maxCacheSize = 1000;
-    private static readonly object _lockObject = new();
-    private static bool _cleanupRunning = false;
-    private static bool _cacheEnabled = true;
+        
+    // 锁对象，用于安全初始化
+    private static readonly object _lockObject = new object();
+        
+    // 上次清理时间
+    private static DateTime _lastCleanupTime = DateTime.UtcNow;
 
-    // 缓存统计
-    private static int _expressionCacheHits = 0;
-    private static int _expressionCacheMisses = 0;
-    private static int _evictionCount = 0;
-    private static int _cleanupCount = 0;
+    #endregion
+
+    #region 公共方法
 
     /// <summary>
-    /// 应用配置到元数据缓存
+    /// 应用缓存配置
     /// </summary>
     public static void ApplyConfiguration(DuckDBConfiguration configuration)
     {
         if (configuration == null) return;
             
-        _maxCacheSize = configuration.MaxCacheSize;
-        _defaultExpirationTime = configuration.CacheExpirationTime;
-        _cacheEnabled = configuration.EnableCache;
-            
-        // 重新配置清理定时器
         lock (_lockObject)
         {
-            _cleanupTimer?.Dispose();
-            _cleanupTimer = new Timer(CleanupCallback, null, 
-                configuration.CacheCleanupInterval, 
-                configuration.CacheCleanupInterval);
+            _config.MaxEntries = configuration.MaxCacheEntries;
+            _config.EnableAdaptiveEviction = configuration.EnableAdaptiveEviction;
+            _config.EvictionCheckInterval = TimeSpan.FromMinutes(configuration.CacheEvictionIntervalMinutes);
+                
+            // 初始化或重置清理计时器
+            if (_cleanupTimer == null)
+            {
+                _cleanupTimer = new Timer(
+                    CleanupCache, 
+                    null, 
+                    _config.EvictionCheckInterval, 
+                    _config.EvictionCheckInterval);
+            }
+            else
+            {
+                _cleanupTimer.Change(_config.EvictionCheckInterval, _config.EvictionCheckInterval);
+            }
         }
     }
-
-    static DuckDBMetadataCache()
-    {
-        // 创建定时清理任务，每小时运行一次
-        _cleanupTimer = new Timer(CleanupCallback, null, TimeSpan.FromHours(1), TimeSpan.FromHours(1));
-    }
-
+        
     /// <summary>
     /// 获取或添加属性缓存
     /// </summary>
-    public static PropertyInfo[] GetOrAddProperties(Type type, Func<Type, PropertyInfo[]> valueFactory)
+    public static PropertyInfo[] GetOrAddProperties(Type type, Func<Type, PropertyInfo[]> factory)
     {
-        if (!_cacheEnabled)
-            return valueFactory(type);
-                
-        return _propertiesCache.GetOrAdd(type, valueFactory);
+        var result = _propertiesCache.GetOrAdd(type, factory);
+        RecordTypeAccess(type);
+        return result;
     }
-
+        
     /// <summary>
     /// 获取或添加属性列映射缓存
     /// </summary>
-    public static Dictionary<string, string> GetOrAddPropertyColumnMappings(Type type, Func<Type, Dictionary<string, string>> valueFactory)
+    public static Dictionary<string, string> GetOrAddPropertyColumnMappings(Type type, Func<Type, Dictionary<string, string>> factory)
     {
-        if (!_cacheEnabled)
-            return valueFactory(type);
-                
-        return _propertyColumnMappingsCache.GetOrAdd(type, valueFactory);
+        var result = _propertyColumnMappingsCache.GetOrAdd(type, factory);
+        RecordTypeAccess(type);
+        return result;
+    }
+        
+    /// <summary>
+    /// 获取或添加实体列名缓存
+    /// </summary>
+    public static List<string> GetOrAddEntityColumns(Type type, Func<Type, List<string>> factory)
+    {
+        var result = _entityColumnsCache.GetOrAdd(type, factory);
+        RecordTypeAccess(type);
+        return result;
     }
 
     /// <summary>
-    /// 获取或添加实体列缓存
+    /// 获取或添加表达式SQL缓存
     /// </summary>
-    public static List<string> GetOrAddEntityColumns(Type type, Func<Type, List<string>> valueFactory)
+    public static string GetOrAddExpressionSql(string expressionKey, Func<string, string> factory)
     {
-        if (!_cacheEnabled)
-            return valueFactory(type);
-                
-        return _entityColumnsCache.GetOrAdd(type, valueFactory);
+        var result = _expressionSqlCache.GetOrAdd(expressionKey, factory);
+        RecordExpressionAccess(expressionKey);
+        return result;
     }
-
+        
     /// <summary>
-    /// 获取或添加表达式SQL缓存，带过期时间
+    /// 预热实体元数据
     /// </summary>
-    public static string GetOrAddExpressionSql(string expressionKey, Func<string, string> valueFactory)
+    public static void PrewarmEntityMetadata(Type entityType)
     {
-        if (!_cacheEnabled)
-            return valueFactory(expressionKey);
-                
-        CheckCacheSize();
-
-        if (_expressionSqlCache.TryGetValue(expressionKey, out var cacheItem) && !cacheItem.IsExpired)
+        try
         {
-            // 缓存命中
-            Interlocked.Increment(ref _expressionCacheHits);
-            cacheItem.LastAccessed = DateTime.UtcNow; // 更新访问时间
-            return cacheItem.Value;
-        }
-
-        // 缓存未命中
-        Interlocked.Increment(ref _expressionCacheMisses);
-        var value = valueFactory(expressionKey);
-        _expressionSqlCache[expressionKey] = new CacheItem<string>(value, DateTime.UtcNow.Add(_defaultExpirationTime));
-        return value;
-    }
-
-    /// <summary>
-    /// 设置自定义过期时间的表达式SQL缓存
-    /// </summary>
-    public static string GetOrAddExpressionSql(string expressionKey, Func<string, string> valueFactory, TimeSpan expirationTime)
-    {
-        if (!_cacheEnabled)
-            return valueFactory(expressionKey);
-                
-        CheckCacheSize();
-
-        if (_expressionSqlCache.TryGetValue(expressionKey, out var cacheItem) && !cacheItem.IsExpired)
-        {
-            Interlocked.Increment(ref _expressionCacheHits);
-            cacheItem.LastAccessed = DateTime.UtcNow;
-            return cacheItem.Value;
-        }
-
-        Interlocked.Increment(ref _expressionCacheMisses);
-        var value = valueFactory(expressionKey);
-        _expressionSqlCache[expressionKey] = new CacheItem<string>(value, DateTime.UtcNow.Add(expirationTime));
-        return value;
-    }
-
-    /// <summary>
-    /// 检查缓存大小并清理过期项
-    /// </summary>
-    private static void CheckCacheSize()
-    {
-        // 如果表达式缓存超过最大大小，则清理最老的20%
-        if (_expressionSqlCache.Count > _maxCacheSize && !_cleanupRunning)
-        {
-            Task.Run(() => TrimExpressionCache());
-        }
-    }
-
-    /// <summary>
-    /// 清理最不常用的缓存项
-    /// </summary>
-    private static void TrimExpressionCache()
-    {
-        if (_cleanupRunning) return;
-
-        lock (_lockObject)
-        {
-            if (_cleanupRunning) return;
-            _cleanupRunning = true;
-
-            try
+            // 确保属性已缓存
+            if (!_propertiesCache.ContainsKey(entityType))
             {
-                // 移除所有过期项
-                int removed = RemoveExpiredItems();
-                Interlocked.Add(ref _evictionCount, removed);
-
-                if (_expressionSqlCache.Count > _maxCacheSize)
-                {
-                    // 按最后访问时间排序并移除最老的20%
-                    var itemsToRemove = _expressionSqlCache
-                        .OrderBy(kv => kv.Value.LastAccessed)
-                        .ThenBy(kv => kv.Value.AccessCount)
-                        .Take(_expressionSqlCache.Count / 5)
-                        .Select(kv => kv.Key)
-                        .ToList();
-
-                    foreach (var key in itemsToRemove)
-                    {
-                        _expressionSqlCache.TryRemove(key, out _);
-                    }
-                        
-                    Interlocked.Add(ref _evictionCount, itemsToRemove.Count);
-                }
+                var properties = entityType.GetProperties()
+                    .Where(p => !p.GetCustomAttributes(typeof(System.ComponentModel.DataAnnotations.Schema.NotMappedAttribute), true).Any())
+                    .ToArray();
+                _propertiesCache[entityType] = properties;
                     
-                Interlocked.Increment(ref _cleanupCount);
+                // 记录初始访问，提高优先级
+                RecordTypeAccess(entityType);
+                RecordTypeAccess(entityType); // 多记录一次增加热度
             }
-            finally
+                
+            // 确保列映射已缓存
+            if (!_propertyColumnMappingsCache.ContainsKey(entityType))
             {
-                _cleanupRunning = false;
+                var mappings = new Dictionary<string, string>();
+                foreach (var prop in _propertiesCache[entityType])
+                {
+                    var columnAttribute = prop.GetCustomAttributes(typeof(ColumnAttribute), true)
+                        .FirstOrDefault() as ColumnAttribute;
+                    mappings[prop.Name] = columnAttribute?.Name ?? prop.Name;
+                }
+                _propertyColumnMappingsCache[entityType] = mappings;
+            }
+                
+            // 确保列名已缓存
+            if (!_entityColumnsCache.ContainsKey(entityType))
+            {
+                var columns = _propertiesCache[entityType]
+                    .Select(p => {
+                        var columnAttribute = p.GetCustomAttributes(typeof(ColumnAttribute), true)
+                            .FirstOrDefault() as ColumnAttribute;
+                        return columnAttribute?.Name ?? p.Name;
+                    })
+                    .ToList();
+                _entityColumnsCache[entityType] = columns;
             }
         }
-    }
-
-    /// <summary>
-    /// 定时清理过期缓存项
-    /// </summary>
-    private static void CleanupCallback(object state)
-    {
-        if (!_cacheEnabled) return;
-            
-        int removed = RemoveExpiredItems();
-        if (removed > 0)
+        catch (Exception ex)
         {
-            Interlocked.Add(ref _evictionCount, removed);
-            Interlocked.Increment(ref _cleanupCount);
+            Console.Error.WriteLine($"预热实体元数据失败: {ex.Message}");
         }
     }
-
-    /// <summary>
-    /// 移除所有过期的缓存项
-    /// </summary>
-    private static int RemoveExpiredItems()
-    {
-        var expiredKeys = _expressionSqlCache
-            .Where(kv => kv.Value.IsExpired)
-            .Select(kv => kv.Key)
-            .ToList();
-
-        foreach (var key in expiredKeys)
-        {
-            _expressionSqlCache.TryRemove(key, out _);
-        }
-            
-        return expiredKeys.Count;
-    }
-
+        
     /// <summary>
     /// 获取缓存统计信息
     /// </summary>
     public static string GetStatistics()
     {
-        var hitRate = _expressionCacheHits + _expressionCacheMisses > 0
-            ? (double)_expressionCacheHits / (_expressionCacheHits + _expressionCacheMisses) * 100
-            : 0;
-
-        return $"属性缓存数: {_propertiesCache.Count}, " +
-               $"列映射缓存数: {_propertyColumnMappingsCache.Count}, " +
-               $"实体列缓存数: {_entityColumnsCache.Count}, " +
-               $"表达式缓存数: {_expressionSqlCache.Count}, " +
-               $"表达式缓存命中率: {hitRate:F2}%, " +
-               $"缓存淘汰数: {_evictionCount}, " +
-               $"清理次数: {_cleanupCount}";
+        int totalMetadataItems = _propertiesCache.Count + _propertyColumnMappingsCache.Count + _entityColumnsCache.Count;
+        int expressionItems = _expressionSqlCache.Count;
+        int highFrequencyItems = _accessMetrics.Values.Count(m => m.AccessCount > 10);
+        int lowFrequencyItems = _accessMetrics.Values.Count(m => m.AccessCount <= 3);
+            
+        var mostAccessedType = _accessMetrics
+            .OrderByDescending(x => x.Value.AccessCount)
+            .FirstOrDefault();
+                
+        var mostAccessedExpression = _expressionAccessMetrics
+            .OrderByDescending(x => x.Value.AccessCount)
+            .FirstOrDefault();
+                
+        string mostAccessedTypeInfo = mostAccessedType.Key != null ?
+            $"最常访问类型: {mostAccessedType.Key.Name}({mostAccessedType.Value.AccessCount}次)" :
+            "无类型访问记录";
+                
+        string mostAccessedExpressionInfo = mostAccessedExpression.Key != null ?
+            $"最常用表达式访问次数: {mostAccessedExpression.Value.AccessCount}" :
+            "无表达式访问记录";
+                
+        return $"元数据缓存项: {totalMetadataItems}, " +
+               $"表达式缓存项: {expressionItems}, " +
+               $"属性缓存: {_propertiesCache.Count}, " +
+               $"列映射缓存: {_propertyColumnMappingsCache.Count}, " +
+               $"实体列名缓存: {_entityColumnsCache.Count}, " +
+               $"高频项: {highFrequencyItems}, " +
+               $"低频项: {lowFrequencyItems}, " +
+               $"{mostAccessedTypeInfo}, " +
+               $"{mostAccessedExpressionInfo}";
     }
         
     /// <summary>
-    /// 获取详细的缓存统计信息
+    /// 手动清理缓存
     /// </summary>
-    public static CacheStatistics GetDetailedStatistics()
+    /// <param name="evictionPercentage">清除百分比(0-100)</param>
+    public static void ManualCleanup(int evictionPercentage = 20)
     {
-        return new CacheStatistics
+        if (evictionPercentage <= 0 || evictionPercentage > 100)
+            evictionPercentage = 20;
+                
+        lock (_lockObject)
         {
-            PropertyCacheCount = _propertiesCache.Count,
-            ColumnMappingCacheCount = _propertyColumnMappingsCache.Count,
-            EntityColumnCacheCount = _entityColumnsCache.Count,
-            ExpressionSqlCacheCount = _expressionSqlCache.Count,
-            ExpressionCacheHits = _expressionCacheHits,
-            ExpressionCacheMisses = _expressionCacheMisses,
-            EvictionCount = _evictionCount,
-            CleanupCount = _cleanupCount,
-            CacheEnabled = _cacheEnabled,
-            MaxCacheSize = _maxCacheSize,
-            ExpirationTimeHours = _defaultExpirationTime.TotalHours,
-            CacheHitRate = _expressionCacheHits + _expressionCacheMisses > 0
-                ? (double)_expressionCacheHits / (_expressionCacheHits + _expressionCacheMisses) * 100
-                : 0
-        };
+            // 清理元数据缓存
+            int totalMetadataEntries = _propertiesCache.Count + _propertyColumnMappingsCache.Count + _entityColumnsCache.Count;
+            int metadataEntriesToRemove = (int)(totalMetadataEntries * evictionPercentage / 100.0);
+                
+            if (metadataEntriesToRemove > 0)
+            {
+                PerformMetadataCleanup(metadataEntriesToRemove);
+            }
+                
+            // 清理表达式缓存
+            int totalExpressionEntries = _expressionSqlCache.Count;
+            int expressionEntriesToRemove = (int)(totalExpressionEntries * evictionPercentage / 100.0);
+                
+            if (expressionEntriesToRemove > 0)
+            {
+                PerformExpressionCleanup(expressionEntriesToRemove);
+            }
+        }
     }
-
+        
     /// <summary>
-    /// 清除表达式缓存
+    /// 清空所有缓存
     /// </summary>
-    public static void ClearExpressionCache()
-    {
-        _expressionSqlCache.Clear();
-        ResetStatistics();
-    }
-
-    /// <summary>
-    /// 清除所有缓存
-    /// </summary>
-    public static void ClearAllCaches()
+    public static void ClearCache()
     {
         _propertiesCache.Clear();
         _propertyColumnMappingsCache.Clear();
         _entityColumnsCache.Clear();
         _expressionSqlCache.Clear();
-        ResetStatistics();
+        _accessMetrics.Clear();
+        _expressionAccessMetrics.Clear();
     }
 
+    #endregion
+
+    #region 内部方法
+
     /// <summary>
-    /// 重置统计数据
+    /// 记录类型访问
     /// </summary>
-    public static void ResetStatistics()
+    private static void RecordTypeAccess(Type type)
     {
-        Interlocked.Exchange(ref _expressionCacheHits, 0);
-        Interlocked.Exchange(ref _expressionCacheMisses, 0);
-        Interlocked.Exchange(ref _evictionCount, 0);
-        Interlocked.Exchange(ref _cleanupCount, 0);
+        if (!_config.EnableAdaptiveEviction) return;
+            
+        _accessMetrics.AddOrUpdate(
+            type,
+            _ => new CacheMetrics { AccessCount = 1, LastAccessTime = DateTime.UtcNow },
+            (_, metrics) => {
+                metrics.AccessCount++;
+                metrics.LastAccessTime = DateTime.UtcNow;
+                return metrics;
+            });
+                
+        // 检查是否需要清理缓存（避免等待计时器而导致内存过高）
+        CheckAndCleanupIfNeeded();
     }
-
+        
     /// <summary>
-    /// 缓存项包装类，包含过期时间和最后访问时间
+    /// 记录表达式访问
     /// </summary>
-    private class CacheItem<T>
+    private static void RecordExpressionAccess(string expressionKey)
     {
-        public T Value { get; }
-        public DateTime Expiration { get; }
-        public DateTime LastAccessed { get; set; }
-        public long AccessCount { get; set; }
-
-        public bool IsExpired => DateTime.UtcNow > Expiration;
-
-        public CacheItem(T value, DateTime expiration)
+        if (!_config.EnableAdaptiveEviction) return;
+            
+        _expressionAccessMetrics.AddOrUpdate(
+            expressionKey,
+            _ => new ExpressionCacheMetrics { AccessCount = 1, LastAccessTime = DateTime.UtcNow },
+            (_, metrics) => {
+                metrics.AccessCount++;
+                metrics.LastAccessTime = DateTime.UtcNow;
+                return metrics;
+            });
+                
+        // 检查是否需要清理表达式缓存
+        CheckAndCleanupIfNeeded();
+    }
+        
+    /// <summary>
+    /// 检查并在必要时清理缓存
+    /// </summary>
+    private static void CheckAndCleanupIfNeeded()
+    {
+        // 检查清理间隔
+        if ((DateTime.UtcNow - _lastCleanupTime) < TimeSpan.FromSeconds(30))
+            return;
+                
+        int totalMetadataEntries = _propertiesCache.Count + _propertyColumnMappingsCache.Count + _entityColumnsCache.Count;
+        int totalExpressionEntries = _expressionSqlCache.Count;
+            
+        // 如果任一缓存项超过最大数量的80%，则执行清理
+        if (totalMetadataEntries > _config.MaxEntries * 0.8 || 
+            totalExpressionEntries > _config.MaxEntries * 0.8)
         {
-            Value = value;
-            Expiration = expiration;
-            LastAccessed = DateTime.UtcNow;
-            AccessCount = 1;
+            lock (_lockObject)
+            {
+                // 双重检查
+                if ((DateTime.UtcNow - _lastCleanupTime) < TimeSpan.FromSeconds(30))
+                    return;
+                        
+                // 清理元数据缓存
+                if (totalMetadataEntries > _config.MaxEntries * 0.8)
+                {
+                    int entriesToRemove = (int)(totalMetadataEntries * 0.2); // 清理20%
+                    PerformMetadataCleanup(entriesToRemove);
+                }
+                    
+                // 清理表达式缓存
+                if (totalExpressionEntries > _config.MaxEntries * 0.8)
+                {
+                    int entriesToRemove = (int)(totalExpressionEntries * 0.2); // 清理20%
+                    PerformExpressionCleanup(entriesToRemove);
+                }
+                    
+                _lastCleanupTime = DateTime.UtcNow;
+            }
         }
     }
         
     /// <summary>
-    /// 缓存统计信息类
+    /// 缓存清理方法
     /// </summary>
-    public class CacheStatistics
+    private static void CleanupCache(object state)
     {
-        public int PropertyCacheCount { get; set; }
-        public int ColumnMappingCacheCount { get; set; }
-        public int EntityColumnCacheCount { get; set; }
-        public int ExpressionSqlCacheCount { get; set; }
-        public int ExpressionCacheHits { get; set; }
-        public int ExpressionCacheMisses { get; set; }
-        public int EvictionCount { get; set; }
-        public int CleanupCount { get; set; }
-        public bool CacheEnabled { get; set; }
-        public int MaxCacheSize { get; set; }
-        public double ExpirationTimeHours { get; set; }
-        public double CacheHitRate { get; set; }
+        if (!_config.EnableAdaptiveEviction) return;
+
+        try
+        {
+            // 检查元数据缓存是否需要清理
+            int totalMetadataEntries = _propertiesCache.Count + _propertyColumnMappingsCache.Count + _entityColumnsCache.Count;
+                
+            if (totalMetadataEntries > _config.MaxEntries)
+            {
+                int entriesToRemove = (int)(totalMetadataEntries * 0.2); // 清理20%
+                PerformMetadataCleanup(entriesToRemove);
+            }
+                
+            // 检查表达式缓存是否需要清理
+            int totalExpressionEntries = _expressionSqlCache.Count;
+                
+            if (totalExpressionEntries > _config.MaxEntries)
+            {
+                int entriesToRemove = (int)(totalExpressionEntries * 0.2); // 清理20%
+                PerformExpressionCleanup(entriesToRemove);
+            }
+                
+            _lastCleanupTime = DateTime.UtcNow;
+        }
+        catch (Exception ex)
+        {
+            // 记录清理异常，但不抛出
+            Console.Error.WriteLine($"缓存清理异常: {ex.Message}");
+        }
+    }
+        
+    /// <summary>
+    /// 执行元数据缓存清理
+    /// </summary>
+    private static void PerformMetadataCleanup(int entriesToRemove)
+    {
+        if (entriesToRemove <= 0) return;
+            
+        try
+        {
+            // 获取访问指标并按评分排序（低评分先淘汰）
+            var metrics = _accessMetrics.ToArray()
+                .Select(kvp => new { Type = kvp.Key, Metrics = kvp.Value })
+                .OrderBy(x => x.Metrics.CalculateScore())
+                .Take(entriesToRemove)
+                .ToList();
+                    
+            int removedCount = 0;
+                
+            // 执行淘汰
+            foreach (var item in metrics)
+            {
+                var type = item.Type;
+                bool removedAny = false;
+                    
+                if (_propertiesCache.TryRemove(type, out _))
+                {
+                    removedAny = true;
+                    removedCount++;
+                }
+                    
+                if (_propertyColumnMappingsCache.TryRemove(type, out _))
+                {
+                    removedAny = true;
+                    removedCount++;
+                }
+                    
+                if (_entityColumnsCache.TryRemove(type, out _))
+                {
+                    removedAny = true;
+                    removedCount++;
+                }
+                    
+                if (removedAny)
+                {
+                    _accessMetrics.TryRemove(type, out _);
+                }
+            }
+                
+            if (removedCount > 0)
+            {
+                Console.WriteLine($"[DuckDB元数据缓存] 已清理 {removedCount} 个低使用频率的元数据缓存项");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"执行元数据缓存清理失败: {ex.Message}");
+        }
+    }
+        
+    /// <summary>
+    /// 执行表达式缓存清理
+    /// </summary>
+    private static void PerformExpressionCleanup(int entriesToRemove)
+    {
+        if (entriesToRemove <= 0) return;
+            
+        try
+        {
+            // 获取表达式访问指标并按评分排序（低评分先淘汰）
+            var metrics = _expressionAccessMetrics.ToArray()
+                .Select(kvp => new { ExpressionKey = kvp.Key, Metrics = kvp.Value })
+                .OrderBy(x => x.Metrics.CalculateScore())
+                .Take(entriesToRemove)
+                .ToList();
+                    
+            int removedCount = 0;
+                
+            // 执行淘汰
+            foreach (var item in metrics)
+            {
+                var expressionKey = item.ExpressionKey;
+                    
+                if (_expressionSqlCache.TryRemove(expressionKey, out _))
+                {
+                    _expressionAccessMetrics.TryRemove(expressionKey, out _);
+                    removedCount++;
+                }
+            }
+                
+            if (removedCount > 0)
+            {
+                Console.WriteLine($"[DuckDB表达式缓存] 已清理 {removedCount} 个低使用频率的表达式缓存项");
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.Error.WriteLine($"执行表达式缓存清理失败: {ex.Message}");
+        }
     }
 
-    // 在应用程序关闭时停止定时器
-    public static void Shutdown()
+    #endregion
+
+    #region 内部类
+
+    /// <summary>
+    /// 元数据缓存指标
+    /// </summary>
+    private class CacheMetrics
     {
-        _cleanupTimer?.Dispose();
+        public int AccessCount { get; set; }
+        public DateTime LastAccessTime { get; set; }
+            
+        /// <summary>
+        /// 计算条目评分 (值越高越应该保留)
+        /// </summary>
+        public double CalculateScore()
+        {
+            // 结合访问频率和时间因素
+            double frequencyFactor = Math.Log10(AccessCount + 1); // 访问次数对数，避免单一高频项过度主导
+            double recencyFactor = 1.0 / (DateTime.UtcNow - LastAccessTime).TotalHours + 1; // 最近访问权重
+                
+            return frequencyFactor * recencyFactor;
+        }
     }
+        
+    /// <summary>
+    /// 表达式缓存指标
+    /// </summary>
+    private class ExpressionCacheMetrics
+    {
+        public int AccessCount { get; set; }
+        public DateTime LastAccessTime { get; set; }
+            
+        /// <summary>
+        /// 计算条目评分 (值越高越应该保留)
+        /// </summary>
+        public double CalculateScore()
+        {
+            // 表达式缓存评分更注重访问频率
+            double frequencyFactor = Math.Log10(AccessCount + 1) * 1.5; // 加权更高
+            double recencyFactor = 1.0 / (DateTime.UtcNow - LastAccessTime).TotalHours + 1;
+                
+            return frequencyFactor * recencyFactor;
+        }
+    }
+        
+    /// <summary>
+    /// 缓存配置
+    /// </summary>
+    private class DuckDBCacheConfiguration
+    {
+        public int MaxEntries { get; set; } = 500; // 默认最大缓存条目
+        public bool EnableAdaptiveEviction { get; set; } = true; // 启用自适应淘汰
+        public TimeSpan EvictionCheckInterval { get; set; } = TimeSpan.FromMinutes(10); // 淘汰检查间隔
+    }
+
+    #endregion
 }

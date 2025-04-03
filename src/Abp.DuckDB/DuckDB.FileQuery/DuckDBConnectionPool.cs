@@ -70,7 +70,7 @@ public class DuckDBConnectionPool : IDisposable
                     // 等待一段时间，尝试再次获取可用连接
                     _poolLock.Release();
                     await Task.Delay(_options.ConnectionWaitTime, cancellationToken);
-                        
+
                     if (_availableConnections.TryTake(out connection))
                     {
                         if (!IsConnectionValid(connection))
@@ -79,7 +79,7 @@ public class DuckDBConnectionPool : IDisposable
                             connection = null;
                         }
                     }
-                        
+
                     if (connection == null)
                     {
                         throw new InvalidOperationException($"连接池已满({_options.MaxConnections}个连接)，无法创建新连接");
@@ -103,7 +103,7 @@ public class DuckDBConnectionPool : IDisposable
         string connectionId = Guid.NewGuid().ToString();
         connection.Id = connectionId;
         connection.LastUsedTime = DateTime.UtcNow;
-            
+
         _busyConnections[connectionId] = connection;
         return connection;
     }
@@ -120,7 +120,7 @@ public class DuckDBConnectionPool : IDisposable
             if (_busyConnections.TryRemove(connection.Id, out _))
             {
                 connection.LastUsedTime = DateTime.UtcNow;
-                    
+
                 // 检查连接状态
                 if (IsConnectionValid(connection))
                 {
@@ -147,28 +147,28 @@ public class DuckDBConnectionPool : IDisposable
     {
         var connection = new DuckDBConnection(_options.ConnectionString);
         connection.Open();
-            
+
         using (var command = connection.CreateCommand())
         {
             command.CommandText = $"PRAGMA threads={_options.ThreadsPerConnection};";
             command.ExecuteNonQuery();
-                
+
             if (!string.IsNullOrEmpty(_options.MemoryLimit))
             {
                 command.CommandText = $"PRAGMA memory_limit='{_options.MemoryLimit}';";
                 command.ExecuteNonQuery();
             }
-                
+
             if (_options.EnableCompression)
             {
                 command.CommandText = $"PRAGMA force_compression='{_options.CompressionType}';";
                 command.ExecuteNonQuery();
             }
         }
-            
-        return new PooledConnection 
-        { 
-            Connection = connection, 
+
+        return new PooledConnection
+        {
+            Connection = connection,
             CreationTime = DateTime.UtcNow,
             LastUsedTime = DateTime.UtcNow
         };
@@ -181,19 +181,19 @@ public class DuckDBConnectionPool : IDisposable
     {
         if (pooledConnection == null || pooledConnection.Connection == null)
             return false;
-                
+
         try
         {
             var connection = pooledConnection.Connection;
-                
+
             // 检查连接状态
             if (connection.State != ConnectionState.Open)
                 return false;
-                    
+
             // 验证连接有效期
             if ((DateTime.UtcNow - pooledConnection.CreationTime).TotalHours >= _options.MaxConnectionLifetimeHours)
                 return false;
-                
+
             // 执行简单查询测试连接
             if (_options.TestConnectionOnBorrow)
             {
@@ -202,7 +202,7 @@ public class DuckDBConnectionPool : IDisposable
                 command.CommandTimeout = 5; // 短超时
                 command.ExecuteScalar();
             }
-                
+
             return true;
         }
         catch (Exception ex)
@@ -223,7 +223,7 @@ public class DuckDBConnectionPool : IDisposable
             {
                 if (pooledConnection.Connection.State != ConnectionState.Closed)
                     pooledConnection.Connection.Close();
-                        
+
                 pooledConnection.Connection.Dispose();
                 pooledConnection.Connection = null;
             }
@@ -250,7 +250,7 @@ public class DuckDBConnectionPool : IDisposable
             int removedCount = 0;
             var now = DateTime.UtcNow;
             var idleThreshold = TimeSpan.FromSeconds(_options.MaxIdleTimeSeconds);
-                
+
             var connectionsToCheck = _availableConnections.ToArray();
             _availableConnections.Clear();
 
@@ -308,12 +308,14 @@ public class DuckDBConnectionPool : IDisposable
             {
                 SafeCloseConnection(conn);
             }
+
             _availableConnections.Clear();
 
             foreach (var conn in _busyConnections.Values)
             {
                 SafeCloseConnection(conn);
             }
+
             _busyConnections.Clear();
 
             _poolLock.Dispose();
@@ -325,34 +327,34 @@ public class DuckDBConnectionPool : IDisposable
 
         _disposed = true;
     }
+}
 
-    /// <summary>
-    /// 池化连接
-    /// </summary>
-    public class PooledConnection
-    {
-        public string Id { get; set; }
-        public DuckDBConnection Connection { get; set; }
-        public DateTime CreationTime { get; set; }
-        public DateTime LastUsedTime { get; set; }
-    }
+/// <summary>
+/// 池化连接
+/// </summary>
+public class PooledConnection
+{
+    public string Id { get; set; }
+    public DuckDBConnection Connection { get; set; }
+    public DateTime CreationTime { get; set; }
+    public DateTime LastUsedTime { get; set; }
+}
 
-    /// <summary>
-    /// 连接池状态
-    /// </summary>
-    public class PoolStatus
+/// <summary>
+/// 连接池状态
+/// </summary>
+public class PoolStatus
+{
+    public int TotalConnections { get; set; }
+    public int AvailableConnections { get; set; }
+    public int BusyConnections { get; set; }
+    public int MaxConnections { get; set; }
+    public int MinConnections { get; set; }
+
+    public override string ToString()
     {
-        public int TotalConnections { get; set; }
-        public int AvailableConnections { get; set; }
-        public int BusyConnections { get; set; }
-        public int MaxConnections { get; set; }
-        public int MinConnections { get; set; }
-            
-        public override string ToString()
-        {
-            return $"总连接: {TotalConnections}, 可用: {AvailableConnections}, " +
-                   $"使用中: {BusyConnections}, 最大/最小: {MaxConnections}/{MinConnections}";
-        }
+        return $"总连接: {TotalConnections}, 可用: {AvailableConnections}, " +
+               $"使用中: {BusyConnections}, 最大/最小: {MaxConnections}/{MinConnections}";
     }
 }
 

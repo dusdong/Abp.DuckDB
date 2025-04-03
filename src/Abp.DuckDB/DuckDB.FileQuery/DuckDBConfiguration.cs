@@ -40,22 +40,22 @@ public class DuckDBConfiguration
     /// 是否使用连接池
     /// </summary>
     public bool UseConnectionPool { get; set; } = true;
-    
+
     /// <summary>
     /// 连接池最小连接数
     /// </summary>
     public int MinConnections { get; set; } = 1;
-    
+
     /// <summary>
     /// 最大连接数
     /// </summary>
     public int MaxConnections { get; set; } = 5;
-    
+
     /// <summary>
     ///
     /// </summary>
     public int MaxIdleTimeSeconds { get; set; } = 300;
-    
+
     /// <summary>
     /// 连接池最大空闲时间
     /// </summary>
@@ -68,22 +68,22 @@ public class DuckDBConfiguration
     /// <summary>
     /// 最大缓存项数量
     /// </summary>
-    public int MaxCacheSize { get; set; } = 1000;
-
-    /// <summary>
-    /// 缓存过期时间
-    /// </summary>
-    public TimeSpan CacheExpirationTime { get; set; } = TimeSpan.FromHours(12);
-
-    /// <summary>
-    /// 是否启用缓存
-    /// </summary>
     public bool EnableCache { get; set; } = true;
 
     /// <summary>
-    /// 缓存清理间隔
+    /// 最大缓存大小（MB）
     /// </summary>
-    public TimeSpan CacheCleanupInterval { get; set; } = TimeSpan.FromHours(1);
+    public int MaxCacheEntries { get; set; } = 500;
+
+    /// <summary>
+    /// 启用自适应淘汰
+    /// </summary>
+    public bool EnableAdaptiveEviction { get; set; } = true;
+
+    /// <summary>
+    /// 淘汰检查间隔
+    /// </summary>
+    public int CacheEvictionIntervalMinutes { get; set; } = 10;
 
     #endregion
 
@@ -190,7 +190,7 @@ public class DuckDBConfiguration
             MemoryLimit = "8GB",
             EnableCompression = true,
             CompressionType = "ZSTD",
-            MaxCacheSize = 5000,
+            MaxCacheEntries = 5000,
             UseStreamingModeByDefault = false,
             DefaultBatchSize = 5000,
             MaxBatchSize = 50000,
@@ -210,7 +210,7 @@ public class DuckDBConfiguration
             MemoryLimit = "1GB",
             EnableCompression = true,
             CompressionType = "ZSTD",
-            MaxCacheSize = 500,
+            MaxCacheEntries = 500,
             UseStreamingModeByDefault = true,
             DefaultBatchSize = 500,
             MaxBatchSize = 2000,
