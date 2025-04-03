@@ -1,18 +1,22 @@
-﻿using System.Diagnostics;
+﻿using System.ComponentModel;
+using System.Data.Common;
+using System.Diagnostics;
 using System.Linq.Expressions;
+using System.Text;
 using Abp.Dependency;
 using Castle.Core.Logging;
+using DuckDB.NET.Data;
 
 namespace Abp.DuckDB.FileQuery;
 
 /// <summary>
 /// DuckDB文件查询提供程序实现
 /// </summary>
-public class DuckDbFileQueryProvider : DuckDbProviderBase, IDuckDbFileQueryProvider, ITransientDependency
+public class DuckDBFileQueryProvider : DuckDbProviderAdvanced, IDuckDBFileQueryProvider, ITransientDependency
 {
     #region 构造函数
 
-    public DuckDbFileQueryProvider(ILogger logger)
+    public DuckDBFileQueryProvider(ILogger logger)
         : base(logger)
     {
     }
@@ -886,6 +890,609 @@ public class DuckDbFileQueryProvider : DuckDbProviderBase, IDuckDbFileQueryProvi
             _logger.Error($"求最大值DuckDB数据失败: {ex.Message}", ex);
             throw;
         }
+    }
+
+    #endregion
+
+    #region 分组聚合
+
+    /// <summary>
+    /// 执行分组聚合查询
+    /// </summary>
+    /// <typeparam name="TResult">结果类型</typeparam>
+    /// <param name="filePaths">要查询的文件列表</param>
+    /// <param name="selectClause">SELECT子句（不包含SELECT关键字）</param>
+    /// <param name="whereClause">WHERE子句（不包含WHERE关键字），可选</param>
+    /// <param name="groupByClause">GROUP BY子句（不包含GROUP BY关键字），可选</param>
+    /// <param name="orderByClause">ORDER BY子句（不包含ORDER BY关键字），可选</param>
+    /// <param name="parameters">查询参数，可选</param>
+    /// <param name="cancellationToken">取消令牌，可选</param>
+    public async Task<List<TResult>> ExecuteGroupByQueryAsync<TResult>(
+        IEnumerable<string> filePaths,
+        string selectClause,
+        string whereClause = null,
+        string groupByClause = null,
+        string orderByClause = null,
+        Dictionary<string, object> parameters = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateFilePaths(filePaths);
+
+        if (string.IsNullOrEmpty(selectClause))
+            throw new ArgumentException("必须提供SELECT子句", nameof(selectClause));
+
+        var stopwatch = Stopwatch.StartNew();
+
+        try
+        {
+            // 构建查询
+            var queryBuilder = new StringBuilder();
+            queryBuilder.Append($"SELECT {selectClause} FROM {BuildParquetSourceClause(filePaths)}");
+
+            if (!string.IsNullOrEmpty(whereClause))
+                queryBuilder.Append($" WHERE {whereClause}");
+
+            if (!string.IsNullOrEmpty(groupByClause))
+                queryBuilder.Append($" GROUP BY {groupByClause}");
+
+            if (!string.IsNullOrEmpty(orderByClause))
+                queryBuilder.Append($" ORDER BY {orderByClause}");
+
+            string sql = queryBuilder.ToString();
+
+            return await ExecuteQueryWithMetricsAsync(
+                async () =>
+                {
+                    using var command = _connection.CreateCommand();
+                    command.CommandText = sql;
+
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+
+                    // 添加参数
+                    if (parameters != null)
+                    {
+                        foreach (var param in parameters)
+                        {
+                            var parameter = command.CreateParameter();
+                            parameter.ParameterName = param.Key;
+                            parameter.Value = param.Value;
+                            command.Parameters.Add(parameter);
+                        }
+                    }
+
+                    return await ExecuteReaderAsync<TResult>(command, cancellationToken).ConfigureAwait(false);
+                },
+                "GroupByQuery",
+                sql,
+                filePaths.Count());
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"执行分组聚合查询失败: {ex.Message}", ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 按指定字段分组计数
+    /// </summary>
+    /// <typeparam name="TEntity">实体类型</typeparam>
+    /// <typeparam name="TGroupKey">分组键类型</typeparam>
+    /// <typeparam name="TResult">计数结果类型，通常为 int 或 long</typeparam>
+    /// <param name="filePaths">要查询的文件列表</param>
+    /// <param name="groupExpression">分组表达式，如 p => p.CategoryId</param>
+    /// <param name="predicate">筛选条件，可选</param>
+    /// <param name="orderByColumn">排序列，可选</param>
+    /// <param name="ascending">是否升序，默认为true</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    /// <returns>按分组键和计数结果的元组列表</returns>
+    public async Task<List<(TGroupKey Key, TResult Count)>> CountByAsync<TEntity, TGroupKey, TResult>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, TGroupKey>> groupExpression,
+        Expression<Func<TEntity, bool>> predicate = null,
+        string orderByColumn = null,
+        bool ascending = true,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateFilePaths(filePaths);
+
+        if (groupExpression == null)
+            throw new ArgumentNullException(nameof(groupExpression));
+
+        var stopwatch = Stopwatch.StartNew();
+
+        try
+        {
+            // 获取分组字段名称
+            string groupColumnName = GetColumnName(groupExpression);
+
+            // 构建WHERE子句
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建完整SQL
+            var queryBuilder = new StringBuilder();
+            queryBuilder.Append($"SELECT {groupColumnName} as Key, COUNT(*) as Count ");
+            queryBuilder.Append($"FROM {BuildParquetSourceClause(filePaths)} ");
+
+            if (!string.IsNullOrEmpty(whereClause))
+                queryBuilder.Append($"WHERE {whereClause} ");
+
+            queryBuilder.Append($"GROUP BY {groupColumnName} ");
+
+            if (!string.IsNullOrEmpty(orderByColumn))
+                queryBuilder.Append($"ORDER BY {orderByColumn} {(ascending ? "ASC" : "DESC")}");
+
+            string sql = queryBuilder.ToString();
+
+            return await ExecuteQueryWithMetricsAsync(
+                async () =>
+                {
+                    using var command = _connection.CreateCommand();
+                    command.CommandText = sql;
+
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+
+                    return await ExecuteReaderAsync<(TGroupKey, TResult)>(command, cancellationToken).ConfigureAwait(false);
+                },
+                "CountBy",
+                sql,
+                filePaths.Count());
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"执行分组计数查询失败: {ex.Message}", ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 按指定字段分组求和
+    /// </summary>
+    /// <typeparam name="TEntity">实体类型</typeparam>
+    /// <typeparam name="TGroupKey">分组键类型</typeparam>
+    /// <typeparam name="TResult">求和结果类型</typeparam>
+    /// <param name="filePaths">要查询的文件列表</param>
+    /// <param name="sumExpression">求和表达式，如 p => p.Amount</param>
+    /// <param name="groupExpression">分组表达式，如 p => p.CategoryId</param>
+    /// <param name="predicate">筛选条件，可选</param>
+    /// <param name="orderByColumn">排序列，可选</param>
+    /// <param name="ascending">是否升序，默认为true</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    /// <returns>按分组键和求和结果的元组列表</returns>
+    public async Task<List<(TGroupKey Key, TResult Sum)>> SumByAsync<TEntity, TGroupKey, TResult>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, TResult>> sumExpression,
+        Expression<Func<TEntity, TGroupKey>> groupExpression,
+        Expression<Func<TEntity, bool>> predicate = null,
+        string orderByColumn = null,
+        bool ascending = true,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateFilePaths(filePaths);
+
+        if (sumExpression == null)
+            throw new ArgumentNullException(nameof(sumExpression));
+
+        if (groupExpression == null)
+            throw new ArgumentNullException(nameof(groupExpression));
+
+        var stopwatch = Stopwatch.StartNew();
+
+        try
+        {
+            // 获取求和和分组字段名称
+            string sumColumnName = GetColumnName(sumExpression);
+            string groupColumnName = GetColumnName(groupExpression);
+
+            // 构建WHERE子句
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建完整SQL
+            var queryBuilder = new StringBuilder();
+            queryBuilder.Append($"SELECT {groupColumnName} as Key, SUM({sumColumnName}) as Sum ");
+            queryBuilder.Append($"FROM {BuildParquetSourceClause(filePaths)} ");
+
+            if (!string.IsNullOrEmpty(whereClause))
+                queryBuilder.Append($"WHERE {whereClause} ");
+
+            queryBuilder.Append($"GROUP BY {groupColumnName} ");
+
+            if (!string.IsNullOrEmpty(orderByColumn))
+                queryBuilder.Append($"ORDER BY {orderByColumn} {(ascending ? "ASC" : "DESC")}");
+
+            string sql = queryBuilder.ToString();
+
+            return await ExecuteQueryWithMetricsAsync(
+                async () =>
+                {
+                    using var command = _connection.CreateCommand();
+                    command.CommandText = sql;
+
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+
+                    return await ExecuteReaderAsync<(TGroupKey, TResult)>(command, cancellationToken).ConfigureAwait(false);
+                },
+                "SumBy",
+                sql,
+                filePaths.Count());
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"执行分组求和查询失败: {ex.Message}", ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 求和并返回指定类型结果
+    /// </summary>
+    public async Task<TResult> SumAsync<TEntity, TResult>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, TResult>> selector,
+        Expression<Func<TEntity, bool>> predicate = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateFilePaths(filePaths);
+
+        if (selector == null)
+            throw new ArgumentNullException(nameof(selector));
+
+        try
+        {
+            // 获取待求和的属性名
+            string columnName = GetColumnName(selector);
+
+            // 使用优化后的SQL表达式访问器
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建聚合查询
+            string sql = BuildDirectParquetAggregateQuery(filePaths, $"SUM({columnName})", whereClause);
+
+            return await ExecuteQueryWithMetricsAsync(
+                async () =>
+                {
+                    using var command = _connection.CreateCommand();
+                    command.CommandText = sql;
+
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+
+                    var result = await command.ExecuteScalarAsync(cancellationToken);
+
+                    // 使用安全转换替代直接转换
+                    return SafeConvert<TResult>(result);
+                },
+                "SumTyped",
+                sql,
+                filePaths.Count());
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"求和DuckDB数据失败: {ex.Message}", ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 计数并返回指定类型结果
+    /// </summary>
+    public async Task<TResult> CountAsync<TEntity, TResult>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, bool>> predicate = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateFilePaths(filePaths);
+
+        try
+        {
+            // 使用优化后的SQL表达式访问器
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建计数查询
+            string countSql = BuildDirectParquetCountQuery(filePaths, whereClause);
+
+            return await ExecuteQueryWithMetricsAsync(
+                async () =>
+                {
+                    using var command = _connection.CreateCommand();
+                    command.CommandText = countSql;
+
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+
+                    var result = await command.ExecuteScalarAsync(cancellationToken);
+
+                    // 使用安全转换替代直接转换
+                    return SafeConvert<TResult>(result);
+                },
+                "CountTyped",
+                countSql,
+                filePaths.Count());
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"统计DuckDB数据失败: {ex.Message}", ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 求最小值并返回指定类型结果
+    /// </summary>
+    public async Task<TResult> MinAsync<TEntity, TResult>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, TResult>> selector,
+        Expression<Func<TEntity, bool>> predicate = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateFilePaths(filePaths);
+
+        if (selector == null)
+            throw new ArgumentNullException(nameof(selector));
+
+        try
+        {
+            // 获取待求最小值的属性名
+            string columnName = GetColumnName(selector);
+
+            // 使用优化后的SQL表达式访问器
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建聚合查询
+            string sql = BuildDirectParquetAggregateQuery(filePaths, $"MIN({columnName})", whereClause);
+
+            return await ExecuteQueryWithMetricsAsync(
+                async () =>
+                {
+                    using var command = _connection.CreateCommand();
+                    command.CommandText = sql;
+
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+
+                    var result = await command.ExecuteScalarAsync(cancellationToken);
+
+                    // 使用安全转换替代直接转换
+                    return SafeConvert<TResult>(result);
+                },
+                "MinTyped",
+                sql,
+                filePaths.Count());
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"求最小值DuckDB数据失败: {ex.Message}", ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 求最大值并返回指定类型结果
+    /// </summary>
+    public async Task<TResult> MaxAsync<TEntity, TResult>(
+        IEnumerable<string> filePaths,
+        Expression<Func<TEntity, TResult>> selector,
+        Expression<Func<TEntity, bool>> predicate = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateFilePaths(filePaths);
+
+        if (selector == null)
+            throw new ArgumentNullException(nameof(selector));
+
+        try
+        {
+            // 获取待求最大值的属性名
+            string columnName = GetColumnName(selector);
+
+            // 使用优化后的SQL表达式访问器
+            string whereClause = string.Empty;
+            if (predicate != null)
+            {
+                var visitor = new SqlExpressionVisitor(_logger);
+                whereClause = visitor.Translate(predicate);
+            }
+
+            // 构建聚合查询
+            string sql = BuildDirectParquetAggregateQuery(filePaths, $"MAX({columnName})", whereClause);
+
+            return await ExecuteQueryWithMetricsAsync(
+                async () =>
+                {
+                    using var command = _connection.CreateCommand();
+                    command.CommandText = sql;
+
+                    // 设置命令超时
+                    if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    {
+                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                    }
+
+                    var result = await command.ExecuteScalarAsync(cancellationToken);
+
+                    // 使用安全转换替代直接转换
+                    return SafeConvert<TResult>(result);
+                },
+                "MaxTyped",
+                sql,
+                filePaths.Count());
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"求最大值DuckDB数据失败: {ex.Message}", ex);
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 安全地将对象转换为指定类型
+    /// </summary>
+    private TResult SafeConvert<TResult>(object value)
+    {
+        if (value == null || value == DBNull.Value)
+            return default!;
+
+        Type targetType = typeof(TResult);
+
+        try
+        {
+            // 处理常见的数值类型
+            if (targetType == typeof(int) || targetType == typeof(int?))
+                return (TResult)(object)Convert.ToInt32(value);
+
+            if (targetType == typeof(long) || targetType == typeof(long?))
+                return (TResult)(object)Convert.ToInt64(value);
+
+            if (targetType == typeof(decimal) || targetType == typeof(decimal?))
+                return (TResult)(object)Convert.ToDecimal(value);
+
+            if (targetType == typeof(double) || targetType == typeof(double?))
+                return (TResult)(object)Convert.ToDouble(value);
+
+            if (targetType == typeof(float) || targetType == typeof(float?))
+                return (TResult)(object)Convert.ToSingle(value);
+
+            // 如果是字符串，直接转换
+            if (targetType == typeof(string))
+                return (TResult)(object)value.ToString();
+
+            // 如果目标类型实现了IConvertible接口，使用正常的转换
+            if (typeof(IConvertible).IsAssignableFrom(targetType))
+                return (TResult)Convert.ChangeType(value, targetType);
+
+            // 原始类型和类型兼容的情况
+            if (value.GetType() == targetType || targetType.IsAssignableFrom(value.GetType()))
+                return (TResult)value;
+
+            // 尝试使用反射进行转换
+            var converter = TypeDescriptor.GetConverter(value.GetType());
+            if (converter != null && converter.CanConvertTo(targetType))
+                return (TResult)converter.ConvertTo(value, targetType);
+
+            converter = TypeDescriptor.GetConverter(targetType);
+            if (converter != null && converter.CanConvertFrom(value.GetType()))
+                return (TResult)converter.ConvertFrom(value);
+
+            // 记录警告并返回默认值
+            _logger.Warn($"无法将类型 {value.GetType().Name} 转换为 {targetType.Name}，返回默认值");
+            return default!;
+        }
+        catch (Exception ex)
+        {
+            _logger.Error($"类型转换失败: {ex.Message}, 源类型: {value.GetType().Name}, 目标类型: {targetType.Name}");
+            return default!;
+        }
+    }
+
+    /// <summary>
+    /// 执行查询并返回指定类型的结果列表
+    /// </summary>
+    private async Task<List<TResult>> ExecuteReaderAsync<TResult>(
+        DuckDBCommand command,
+        CancellationToken cancellationToken = default)
+    {
+        var results = new List<TResult>();
+
+        using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        var resultType = typeof(TResult);
+        var isTuple = resultType.Name.Contains("Tuple") || resultType.Name.Contains("ValueTuple");
+
+        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (isTuple)
+            {
+                // 处理元组类型的返回值
+                object result = CreateTupleFromReader(reader, resultType);
+                results.Add((TResult)result);
+            }
+            else
+            {
+                // 处理普通类型的返回值
+                results.Add(MapReaderToValue<TResult>(reader));
+            }
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// 从数据读取器创建元组
+    /// </summary>
+    private object CreateTupleFromReader(DbDataReader reader, Type tupleType)
+    {
+        var tupleFields = tupleType.GetFields();
+        var fieldValues = new object[tupleFields.Length];
+
+        for (int i = 0; i < tupleFields.Length && i < reader.FieldCount; i++)
+        {
+            var fieldType = tupleFields[i].FieldType;
+            var value = reader.IsDBNull(i) ? null : reader.GetValue(i);
+
+            if (value != null && value != DBNull.Value)
+            {
+                fieldValues[i] = Convert.ChangeType(value, fieldType);
+            }
+        }
+
+        return Activator.CreateInstance(tupleType, fieldValues);
+    }
+
+    /// <summary>
+    /// 将数据读取器的第一列映射为指定类型的值
+    /// </summary>
+    private TResult MapReaderToValue<TResult>(DbDataReader reader)
+    {
+        if (reader.IsDBNull(0))
+            return default;
+
+        var value = reader.GetValue(0);
+        return SafeConvert<TResult>(value); // 使用安全转换替代直接转换
     }
 
     #endregion
