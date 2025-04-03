@@ -10,7 +10,7 @@ namespace Abp.DuckDB.FileQuery;
 /// <summary>
 /// DuckDB查询提供程序基础实现
 /// </summary>
-public abstract class DuckDBQueryProviderBase : IDuckDBQueryProvider
+public abstract class DuckDbProviderBase : IDuckDBProvider
 {
     #region 私有字段与内部类
 
@@ -64,7 +64,7 @@ public abstract class DuckDBQueryProviderBase : IDuckDBQueryProvider
     /// </summary>
     /// <param name="logger">日志记录器</param>
     /// <param name="performanceMonitor">性能监视器，如果为null则创建新实例</param>
-    protected DuckDBQueryProviderBase(ILogger logger, QueryPerformanceMonitor performanceMonitor = null)
+    protected DuckDbProviderBase(ILogger logger, QueryPerformanceMonitor performanceMonitor = null)
     {
         _logger = logger ?? NullLogger.Instance;
         _configuration = DuckDBConfiguration.HighPerformance(); // 使用默认配置

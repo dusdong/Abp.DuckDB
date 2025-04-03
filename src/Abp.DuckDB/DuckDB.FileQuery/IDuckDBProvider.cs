@@ -3,7 +3,7 @@
 /// <summary>
 /// DuckDB 查询提供程序基础接口
 /// </summary>
-public interface IDuckDBQueryProvider : IDuckDBPerformanceMonitor, IDisposable
+public interface IDuckDBProvider : IDuckDBPerformanceMonitor, IDisposable
 {
     /// <summary>
     /// 初始化查询提供程序 - 支持简单连接字符串

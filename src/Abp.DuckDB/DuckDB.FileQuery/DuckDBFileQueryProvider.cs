@@ -8,11 +8,11 @@ namespace Abp.DuckDB.FileQuery;
 /// <summary>
 /// DuckDB文件查询提供程序实现
 /// </summary>
-public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQueryProvider, ITransientDependency
+public class DuckDbFileQueryProvider : DuckDbProviderBase, IDuckDbFileQueryProvider, ITransientDependency
 {
     #region 构造函数
 
-    public DuckDBFileQueryProvider(ILogger logger)
+    public DuckDbFileQueryProvider(ILogger logger)
         : base(logger)
     {
     }
