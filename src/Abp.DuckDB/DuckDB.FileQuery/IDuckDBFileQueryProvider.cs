@@ -5,23 +5,8 @@ namespace Abp.DuckDB.FileQuery;
 /// <summary>
 /// DuckDB文件查询提供程序接口
 /// </summary>
-public interface IDuckDBFileQueryProvider : IDisposable
+public interface IDuckDBFileQueryProvider : IDuckDBQueryProvider, IDuckDBPerformanceMonitor
 {
-    /// <summary>
-    /// 初始化查询提供程序 - 支持简单连接字符串
-    /// </summary>
-    void Initialize(string connectionString);
-
-    /// <summary>
-    /// 使用配置初始化查询提供程序
-    /// </summary>
-    void Initialize(DuckDBConfiguration configuration);
-
-    /// <summary>
-    /// 分析查询计划
-    /// </summary>
-    Task<string> AnalyzeQueryPlanAsync(string sql);
-
     /// <summary>
     /// 查询数据
     /// </summary>
@@ -112,58 +97,4 @@ public interface IDuckDBFileQueryProvider : IDisposable
         IEnumerable<string> filePaths,
         Expression<Func<TEntity, decimal>> selector,
         Expression<Func<TEntity, bool>> predicate = null);
-
-    /// <summary>
-    /// 通过自定义SQL查询数据
-    /// </summary>
-    Task<List<TEntity>> QueryWithRawSqlAsync<TEntity>(string sql, params object[] parameters);
-
-    /// <summary>
-    /// 获取性能统计报告
-    /// </summary>
-    QueryPerformanceMonitor.PerformanceReport GetPerformanceReport();
-
-    /// <summary>
-    /// 获取查询类型的性能指标
-    /// </summary>
-    QueryPerformanceMonitor.QueryMetrics GetMetricsForQueryType(string queryType);
-
-    /// <summary>
-    /// 重置性能指标
-    /// </summary>
-    void ResetPerformanceMetrics();
-
-    /// <summary>
-    /// 预热实体元数据，提前缓存以提高性能
-    /// </summary>
-    /// <param name="entityTypes">需要预热的实体类型集合</param>
-    void PrewarmEntityMetadata(params Type[] entityTypes);
-
-    /// <summary>
-    /// 预热实体元数据，提前缓存以提高性能
-    /// </summary>
-    /// <param name="entityTypes">需要预热的实体类型集合</param>
-    void PrewarmEntityMetadata(IEnumerable<Type> entityTypes);
-
-    /// <summary>
-    /// 获取连接池状态信息
-    /// </summary>
-    public PoolStatus GetConnectionPoolStatus();
-
-    /// <summary>
-    /// 手动清理缓存
-    /// </summary>
-    /// <param name="evictionPercentage">要清除的缓存百分比 (0-100)</param>
-    void CleanupCache(int evictionPercentage = 20);
-
-    /// <summary>
-    /// 清空所有缓存
-    /// </summary>
-    void ClearAllCaches();
-
-    /// <summary>
-    /// 获取缓存统计信息
-    /// </summary>
-    /// <returns>缓存统计信息字符串</returns>
-    string GetCacheStatistics();
 }

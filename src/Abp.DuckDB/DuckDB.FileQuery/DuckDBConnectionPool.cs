@@ -103,6 +103,7 @@ public class DuckDBConnectionPool : IDisposable
         string connectionId = Guid.NewGuid().ToString();
         connection.Id = connectionId;
         connection.LastUsedTime = DateTime.UtcNow;
+        connection.SetPool(this); // 设置连接池引用
 
         _busyConnections[connectionId] = connection;
         return connection;
@@ -166,12 +167,14 @@ public class DuckDBConnectionPool : IDisposable
             }
         }
 
-        return new PooledConnection
+        var pooledConnection = new PooledConnection
         {
             Connection = connection,
             CreationTime = DateTime.UtcNow,
             LastUsedTime = DateTime.UtcNow
         };
+        pooledConnection.SetPool(this); // 设置连接池引用
+        return pooledConnection;
     }
 
     /// <summary>
@@ -338,6 +341,23 @@ public class PooledConnection
     public DuckDBConnection Connection { get; set; }
     public DateTime CreationTime { get; set; }
     public DateTime LastUsedTime { get; set; }
+
+    // 连接池引用，用于归还连接
+    private DuckDBConnectionPool _pool;
+
+    // 设置连接池引用
+    internal void SetPool(DuckDBConnectionPool pool)
+    {
+        _pool = pool;
+    }
+
+    /// <summary>
+    /// 将连接释放回池中
+    /// </summary>
+    public void Release()
+    {
+        _pool?.ReleaseConnection(this);
+    }
 }
 
 /// <summary>

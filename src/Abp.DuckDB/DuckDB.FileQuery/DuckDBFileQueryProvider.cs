@@ -1,8 +1,5 @@
-﻿using System.Collections.Concurrent;
-using System.Data;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Linq.Expressions;
-using System.Reflection;
 using Abp.Dependency;
 using Castle.Core.Logging;
 using DuckDB.NET.Data;
@@ -10,263 +7,23 @@ using DuckDB.NET.Data;
 namespace Abp.DuckDB.FileQuery;
 
 /// <summary>
-/// 基于DuckDB的文件查询提供程序实现
+/// DuckDB文件查询提供程序实现
 /// </summary>
-public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDependency, IDisposable
+public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQueryProvider, IDuckDBPerformanceMonitor, ITransientDependency
 {
-    #region 私有字段
-
-    // 连接池相关
-    private static DuckDBConnectionPool _connectionPool;
-    private static readonly object _poolInitLock = new object();
-    private static Timer _maintenanceTimer;
-
-    // 连接相关
-    private DuckDBConnection _connection;
-    private readonly ILogger _logger;
-    private bool _disposed = false;
-    private DuckDBConfiguration _configuration;
-    private PooledConnection _pooledConnection;
-
-    // 添加预编译语句缓存
-    private readonly ConcurrentDictionary<string, PreparedStatementWrapper> _statementCache = new();
-
-    #endregion
-
-    #region 内部类
-
-    // 预编译语句包装器，用于管理预编译语句的生命周期
-    private class PreparedStatementWrapper : IDisposable
-    {
-        public DuckDBCommand Command { get; }
-        private bool _disposed = false;
-
-        public PreparedStatementWrapper(DuckDBCommand command)
-        {
-            Command = command;
-        }
-
-        public void Dispose()
-        {
-            if (!_disposed)
-            {
-                Command?.Dispose();
-                _disposed = true;
-            }
-        }
-    }
-
-    #endregion
+    #region 构造函数
 
     public DuckDBFileQueryProvider(ILogger logger)
+        : base(logger)
     {
-        _logger = logger ?? NullLogger.Instance;
-        _configuration = DuckDBConfiguration.HighPerformance(); // 使用默认配置
-    }
-
-    #region 初始化方法
-
-    /// <summary>
-    /// 初始化DuckDB查询提供程序
-    /// </summary>
-    public void Initialize(string connectionString)
-    {
-        var config = new DuckDBConfiguration { ConnectionString = connectionString };
-        Initialize(config);
-    }
-
-    /// <summary>
-    /// 使用配置初始化DuckDB查询提供程序
-    /// </summary>
-    public void Initialize(DuckDBConfiguration configuration)
-    {
-        try
-        {
-            if (configuration == null)
-            {
-                throw new ArgumentNullException(nameof(configuration));
-            }
-
-            _configuration = configuration;
-
-            // 应用配置到缓存系统
-            DuckDBMetadataCache.ApplyConfiguration(configuration);
-
-            if (_configuration.UseConnectionPool)
-            {
-                // 初始化连接池并获取连接
-                InitializeConnectionPool();
-                _pooledConnection = _connectionPool.GetConnectionAsync().GetAwaiter().GetResult();
-                _connection = _pooledConnection.Connection;
-
-                _logger.Info($"DuckDB查询提供程序初始化成功，使用连接池，线程数：{configuration.ThreadCount}，内存限制：{configuration.MemoryLimit}");
-
-                // 初始化维护计时器
-                if (_maintenanceTimer == null)
-                {
-                    _maintenanceTimer = new Timer(
-                        _ => PerformPoolMaintenance(),
-                        null,
-                        TimeSpan.FromMinutes(5),
-                        TimeSpan.FromMinutes(5));
-                }
-            }
-            else
-            {
-                // 使用配置的连接字符串
-                _connection = new DuckDBConnection(configuration.ConnectionString);
-                _connection.Open();
-
-                using (var cmd = _connection.CreateCommand())
-                {
-                    // 设置线程数
-                    cmd.CommandText = $"PRAGMA threads={configuration.ThreadCount};";
-                    cmd.ExecuteNonQuery();
-
-                    // 内存管理配置
-                    if (!string.IsNullOrEmpty(configuration.MemoryLimit))
-                    {
-                        cmd.CommandText = $"PRAGMA memory_limit='{configuration.MemoryLimit}';";
-                        cmd.ExecuteNonQuery();
-                    }
-
-                    // 压缩配置
-                    if (configuration.EnableCompression)
-                    {
-                        cmd.CommandText = $"PRAGMA force_compression='{configuration.CompressionType}';";
-                        cmd.ExecuteNonQuery();
-                    }
-                }
-
-                _logger.Info($"DuckDB查询提供程序初始化成功，线程数：{configuration.ThreadCount}，内存限制：{configuration.MemoryLimit}");
-            }
-        }
-        catch (Exception ex)
-        {
-            _logger.Error("初始化DuckDB查询提供程序失败", ex);
-            throw;
-        }
-    }
-
-    /// <summary>
-    /// 初始化连接池
-    /// </summary>
-    private void InitializeConnectionPool()
-    {
-        if (_connectionPool == null)
-        {
-            lock (_poolInitLock)
-            {
-                if (_connectionPool == null)
-                {
-                    var poolOptions = new DuckDBPoolOptions
-                    {
-                        ConnectionString = _configuration.ConnectionString,
-                        MinConnections = _configuration.MinConnections,
-                        MaxConnections = _configuration.MaxConnections,
-                        ThreadsPerConnection = _configuration.ThreadCount,
-                        MemoryLimit = _configuration.MemoryLimit,
-                        MaxIdleTimeSeconds = _configuration.MaxIdleTimeSeconds,
-                        MaxConnectionLifetimeHours = _configuration.MaxConnectionLifetimeHours,
-                        EnableCompression = _configuration.EnableCompression,
-                        CompressionType = _configuration.CompressionType
-                    };
-                    _connectionPool = new DuckDBConnectionPool(poolOptions, _logger);
-                }
-            }
-        }
-    }
-
-    /// <summary>
-    /// 执行连接池维护
-    /// </summary>
-    private static void PerformPoolMaintenance()
-    {
-        _connectionPool?.CleanIdleConnections();
-    }
-
-    /// <summary>
-    /// 获取连接池状态信息
-    /// </summary>
-    public PoolStatus GetConnectionPoolStatus()
-    {
-        return _connectionPool?.GetStatus();
     }
 
     #endregion
 
-    #region 语句缓存
+    #region IDuckDBPerformanceMonitor 实现
 
     /// <summary>
-    /// 获取或创建预编译语句
-    /// </summary>
-    private PreparedStatementWrapper GetOrCreatePreparedStatement(string sql, bool forceCreate = false)
-    {
-        // 如果强制创建新实例，则不使用缓存
-        if (forceCreate || !_configuration.EnableCache)
-        {
-            var command = _connection.CreateCommand();
-            command.CommandText = sql;
-
-            // 设置命令超时
-            if (_configuration.CommandTimeout != TimeSpan.Zero)
-            {
-                command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
-            }
-
-            try
-            {
-                command.Prepare(); // 预编译语句
-            }
-            catch (Exception ex)
-            {
-                _logger.Warn($"预编译语句失败 (非致命): {ex.Message}");
-                // 继续使用未预编译的命令
-            }
-
-            return new PreparedStatementWrapper(command);
-        }
-
-        // 从缓存获取或创建
-        return _statementCache.GetOrAdd(sql, key =>
-        {
-            try
-            {
-                var command = _connection.CreateCommand();
-                command.CommandText = key;
-
-                // 设置命令超时
-                if (_configuration.CommandTimeout != TimeSpan.Zero)
-                {
-                    command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
-                }
-
-                try
-                {
-                    command.Prepare(); // 预编译语句
-                }
-                catch (Exception ex)
-                {
-                    _logger.Warn($"预编译语句失败 (非致命): {ex.Message}");
-                    // 继续使用未预编译的命令
-                }
-
-                return new PreparedStatementWrapper(command);
-            }
-            catch (Exception ex)
-            {
-                _logger.Error($"创建预编译语句失败: {ex.Message}, SQL: {key}", ex);
-                throw;
-            }
-        });
-    }
-
-    #endregion
-
-    #region 查询方法
-
-    /// <summary>
-    /// 阶段一优化：添加查询分析功能
+    /// 分析查询计划
     /// </summary>
     public async Task<string> AnalyzeQueryPlanAsync(string sql)
     {
@@ -282,6 +39,50 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
 
         return (string)await command.ExecuteScalarAsync();
     }
+
+    /// <summary>
+    /// 获取性能报告
+    /// </summary>
+    public QueryPerformanceReport GetPerformanceReport()
+    {
+        return QueryPerformanceMonitor.GenerateReport();
+    }
+
+    /// <summary>
+    /// 获取查询类型的性能指标
+    /// </summary>
+    public QueryPerformanceMetrics GetMetricsForQueryType(string queryType)
+    {
+        return QueryPerformanceMonitor.GetMetricsForQueryType(queryType);
+    }
+
+    /// <summary>
+    /// 重置性能指标
+    /// </summary>
+    public void ResetPerformanceMetrics()
+    {
+        QueryPerformanceMonitor.ResetMetrics();
+    }
+
+    /// <summary>
+    /// 获取最近的查询执行日志
+    /// </summary>
+    public List<QueryExecutionLog> GetRecentExecutions(int count = 100)
+    {
+        return QueryPerformanceMonitor.GetRecentExecutions(count);
+    }
+
+    /// <summary>
+    /// 清除最近的执行日志
+    /// </summary>
+    public void ClearExecutionLogs()
+    {
+        QueryPerformanceMonitor.ClearExecutionLogs();
+    }
+
+    #endregion
+
+    #region 文件查询特定方法
 
     /// <summary>
     /// 查询特定类型的存档数据
@@ -999,7 +800,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     }
 
     /// <summary>
-    /// 获取特定列的合计值
+    /// 求和
     /// </summary>
     public async Task<decimal> SumAsync<TEntity>(
         IEnumerable<string> filePaths,
@@ -1072,7 +873,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     }
 
     /// <summary>
-    /// 获取特定列的平均值
+    /// 求平均值
     /// </summary>
     public async Task<decimal> AvgAsync<TEntity>(
         IEnumerable<string> filePaths,
@@ -1145,7 +946,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     }
 
     /// <summary>
-    /// 获取特定列的最小值
+    /// 求最小值
     /// </summary>
     public async Task<decimal> MinAsync<TEntity>(
         IEnumerable<string> filePaths,
@@ -1218,7 +1019,7 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
     }
 
     /// <summary>
-    /// 获取特定列的最大值
+    /// 求最大值
     /// </summary>
     public async Task<decimal> MaxAsync<TEntity>(
         IEnumerable<string> filePaths,
@@ -1290,178 +1091,9 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         }
     }
 
-    /// <summary>
-    /// 通过自定义SQL查询数据
-    /// </summary>
-    public async Task<List<TEntity>> QueryWithRawSqlAsync<TEntity>(string sql, params object[] parameters)
-    {
-        if (string.IsNullOrWhiteSpace(sql))
-            throw new ArgumentNullException(nameof(sql));
-
-        try
-        {
-            return await ExecuteQueryWithMetricsAsync(
-                async () =>
-                {
-                    using var command = _connection.CreateCommand();
-                    command.CommandText = sql;
-
-                    // 设置命令超时
-                    if (_configuration.CommandTimeout != TimeSpan.Zero)
-                    {
-                        command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
-                    }
-
-                    if (parameters != null && parameters.Length > 0)
-                    {
-                        for (int i = 0; i < parameters.Length; i++)
-                        {
-                            var parameter = new DuckDBParameter
-                            {
-                                ParameterName = $"p{i}",
-                                Value = parameters[i] ?? DBNull.Value
-                            };
-                            command.Parameters.Add(parameter);
-                        }
-                    }
-
-                    return await ExecuteReaderAsync<TEntity>(command).ConfigureAwait(false);
-                },
-                "RawSql",
-                sql,
-                0);
-        }
-        catch (Exception ex)
-        {
-            _logger.Error($"执行自定义SQL查询失败: {ex.Message}，SQL语句：{sql}", ex);
-
-            // 记录失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    "RawSql",
-                    sql,
-                    0,
-                    0,
-                    0,
-                    false,
-                    ex);
-            }
-
-            throw new Exception($"执行自定义SQL查询失败", ex);
-        }
-    }
-
     #endregion
 
-    #region 监控和指标
-
-    /// <summary>
-    /// 获取性能报告
-    /// </summary>
-    public QueryPerformanceMonitor.PerformanceReport GetPerformanceReport()
-    {
-        return QueryPerformanceMonitor.GenerateReport();
-    }
-
-    /// <summary>
-    /// 获取查询类型的性能指标
-    /// </summary>
-    public QueryPerformanceMonitor.QueryMetrics GetMetricsForQueryType(string queryType)
-    {
-        return QueryPerformanceMonitor.GetMetricsForQueryType(queryType);
-    }
-
-    /// <summary>
-    /// 重置性能指标
-    /// </summary>
-    public void ResetPerformanceMetrics()
-    {
-        QueryPerformanceMonitor.ResetMetrics();
-    }
-
-    #endregion
-
-    #region 缓存管理
-
-    /// <summary>
-    /// 预热实体元数据，提前缓存以提高性能
-    /// </summary>
-    /// <param name="entityTypes">需要预热的实体类型集合</param>
-    public void PrewarmEntityMetadata(params Type[] entityTypes)
-    {
-        if (entityTypes == null || entityTypes.Length == 0) return;
-
-        _logger.Debug("开始预热DuckDB元数据缓存");
-        foreach (var entityType in entityTypes)
-        {
-            DuckDBMetadataCache.PrewarmEntityMetadata(entityType);
-        }
-
-        _logger.Debug($"DuckDB元数据缓存预热完成，共预热 {entityTypes.Length} 个实体类型");
-    }
-
-    /// <summary>
-    /// 预热实体元数据，提前缓存以提高性能
-    /// </summary>
-    /// <param name="entityTypes">需要预热的实体类型集合</param>
-    public void PrewarmEntityMetadata(IEnumerable<Type> entityTypes)
-    {
-        if (entityTypes == null) return;
-
-        _logger.Debug("开始预热DuckDB元数据缓存");
-        int count = 0;
-        foreach (var entityType in entityTypes)
-        {
-            DuckDBMetadataCache.PrewarmEntityMetadata(entityType);
-            count++;
-        }
-
-        _logger.Debug($"DuckDB元数据缓存预热完成，共预热 {count} 个实体类型");
-
-        // 输出连接池状态（如果使用连接池）
-        if (_configuration.UseConnectionPool && _connectionPool != null)
-        {
-            var status = _connectionPool.GetStatus();
-            _logger.Debug($"DuckDB连接池状态: 总连接数: {status.TotalConnections}, " +
-                          $"可用连接: {status.AvailableConnections}, " +
-                          $"使用中连接: {status.BusyConnections}");
-        }
-    }
-
-    /// <summary>
-    /// 手动清理缓存
-    /// </summary>
-    /// <param name="evictionPercentage">要清除的缓存百分比 (0-100)</param>
-    public void CleanupCache(int evictionPercentage = 20)
-    {
-        _logger.Debug($"手动清理缓存，清理比例: {evictionPercentage}%");
-        DuckDBMetadataCache.ManualCleanup(evictionPercentage);
-        _logger.Info($"缓存清理完成，当前缓存状态: {DuckDBMetadataCache.GetStatistics()}");
-    }
-
-    /// <summary>
-    /// 清空所有缓存
-    /// </summary>
-    public void ClearAllCaches()
-    {
-        _logger.Debug("清空所有元数据缓存");
-        DuckDBMetadataCache.ClearCache();
-        _logger.Info("所有元数据缓存已清空");
-    }
-
-    /// <summary>
-    /// 获取缓存统计信息
-    /// </summary>
-    /// <returns>缓存统计信息字符串</returns>
-    public string GetCacheStatistics()
-    {
-        return DuckDBMetadataCache.GetStatistics();
-    }
-
-    #endregion
-
-    #region SQL构建
+    #region 文件SQL构建
 
     /// <summary>
     /// 直接构建查询SQL，不使用参数化
@@ -1569,6 +1201,9 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         return sql;
     }
 
+    /// <summary>
+    /// 构建Parquet源子句
+    /// </summary>
     private string BuildParquetSourceClause(IEnumerable<string> filePaths)
     {
         var escapedPaths = filePaths.Select(p => $"'{p.Replace("'", "''")}'");
@@ -1578,7 +1213,16 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
 
     #endregion
 
-    #region 辅助方法
+    #region 文件查询辅助方法
+
+    /// <summary>
+    /// 验证文件路径列表
+    /// </summary>
+    private void ValidateFilePaths(IEnumerable<string> filePaths)
+    {
+        if (filePaths == null || !filePaths.Any())
+            throw new ArgumentException("必须提供至少一个文件路径", nameof(filePaths));
+    }
 
     /// <summary>
     /// 带指标收集的查询执行方法
@@ -1757,266 +1401,5 @@ public class DuckDBFileQueryProvider : IDuckDBFileQueryProvider, ITransientDepen
         throw new Exception($"执行查询失败，已重试 {retryCount} 次", lastException);
     }
 
-    /// <summary>
-    /// 构建列映射字典（优化使用缓存）
-    /// </summary>
-    private Dictionary<PropertyInfo, int> BuildColumnMappings(
-        System.Data.Common.DbDataReader reader,
-        PropertyInfo[] properties)
-    {
-        // 构建读取器列名到索引的映射
-        var columnIndexMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        for (int i = 0; i < reader.FieldCount; i++)
-        {
-            columnIndexMap[reader.GetName(i)] = i;
-        }
-
-        // 获取属性声明类型
-        var type = properties.Length > 0 ? properties[0].DeclaringType : null;
-        if (type == null) return new Dictionary<PropertyInfo, int>();
-
-        // 从缓存获取属性到列名的映射
-        var propertyColumnMap = DuckDBMetadataCache.GetOrAddPropertyColumnMappings(type, t =>
-        {
-            var map = new Dictionary<string, string>();
-            foreach (var prop in properties)
-            {
-                var columnAttribute = prop.GetCustomAttributes(typeof(ColumnAttribute), true)
-                    .FirstOrDefault() as ColumnAttribute;
-
-                string columnName = columnAttribute?.Name ?? prop.Name;
-                map[prop.Name] = columnName;
-            }
-
-            return map;
-        });
-
-        // 使用缓存的列名映射创建属性到索引的映射
-        var columnMappings = new Dictionary<PropertyInfo, int>();
-        foreach (var prop in properties)
-        {
-            if (propertyColumnMap.TryGetValue(prop.Name, out string columnName) &&
-                columnIndexMap.TryGetValue(columnName, out int columnIndex))
-            {
-                columnMappings[prop] = columnIndex;
-            }
-        }
-
-        return columnMappings;
-    }
-
-    /// <summary>
-    /// 从数据读取器映射实体
-    /// </summary>
-    private TEntity MapReaderToEntity<TEntity>(
-        System.Data.Common.DbDataReader reader,
-        PropertyInfo[] properties,
-        Dictionary<PropertyInfo, int> columnMappings)
-    {
-        var entity = Activator.CreateInstance<TEntity>();
-
-        foreach (var mapping in columnMappings)
-        {
-            var prop = mapping.Key;
-            var columnIndex = mapping.Value;
-
-            if (reader.IsDBNull(columnIndex))
-                continue;
-
-            var value = reader.GetValue(columnIndex);
-
-            try
-            {
-                // 处理类型转换
-                if (prop.PropertyType.IsEnum && value is string strValue)
-                {
-                    // 字符串枚举值转换
-                    prop.SetValue(entity, Enum.Parse(prop.PropertyType, strValue));
-                }
-                else if (prop.PropertyType == typeof(DateTime) && value is string dateStr)
-                {
-                    // 字符串日期转换
-                    prop.SetValue(entity, DateTime.Parse(dateStr));
-                }
-                else if (prop.PropertyType == typeof(Guid) && value is string guidStr)
-                {
-                    // 字符串GUID转换
-                    prop.SetValue(entity, Guid.Parse(guidStr));
-                }
-                else
-                {
-                    // 标准类型转换
-                    prop.SetValue(entity, Convert.ChangeType(value,
-                        Nullable.GetUnderlyingType(prop.PropertyType) ?? prop.PropertyType));
-                }
-            }
-            catch (Exception ex)
-            {
-                _logger.Error(
-                    $"属性{prop.Name}设值失败。值类型:{value?.GetType().Name ?? "null"}，" +
-                    $"目标类型:{prop.PropertyType.Name}，值:{value}，错误:{ex.Message}", ex);
-                // 继续处理下一个属性
-            }
-        }
-
-        return entity;
-    }
-
-    /// <summary>
-    /// 获取实体类型的列名（使用缓存）
-    /// </summary>
-    private IEnumerable<string> GetEntityColumns<TEntity>()
-    {
-        var type = typeof(TEntity);
-        return DuckDBMetadataCache.GetOrAddEntityColumns(type, t =>
-        {
-            var properties = t.GetProperties()
-                .Where(prop => !prop.GetCustomAttributes(typeof(NotMappedAttribute), true).Any());
-
-            return properties.Select(p =>
-            {
-                var columnAttribute = p.GetCustomAttributes(typeof(ColumnAttribute), true)
-                    .FirstOrDefault() as ColumnAttribute;
-                return columnAttribute?.Name ?? p.Name;
-            }).ToList();
-        });
-    }
-
-    /// <summary>
-    /// 验证文件路径
-    /// </summary>
-    private void ValidateFilePaths(IEnumerable<string> filePaths)
-    {
-        if (filePaths == null || !filePaths.Any())
-            throw new ArgumentException("必须提供至少一个文件路径", nameof(filePaths));
-    }
-
-    /// <summary>
-    /// 获取列名
-    /// </summary>
-    private string GetColumnName<TEntity, TProperty>(Expression<Func<TEntity, TProperty>> selector)
-    {
-        if (selector.Body is MemberExpression memberExpr)
-        {
-            return memberExpr.Member.Name;
-        }
-
-        throw new ArgumentException("Selector必须是一个属性访问表达式");
-    }
-
-    /// <summary>
-    /// 执行读取查询并返回实体列表（使用缓存）
-    /// </summary>
-    private async Task<List<TEntity>> ExecuteReaderAsync<TEntity>(DuckDBCommand command)
-    {
-        using var reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
-        var results = new List<TEntity>();
-
-        // 从缓存获取属性（优化）
-        var type = typeof(TEntity);
-        var properties = DuckDBMetadataCache.GetOrAddProperties(type, t =>
-            t.GetProperties()
-                .Where(prop => !prop.GetCustomAttributes(typeof(NotMappedAttribute), true).Any())
-                .ToArray());
-
-        // 缓存列映射
-        var columnMappings = BuildColumnMappings(reader, properties);
-
-        while (await reader.ReadAsync().ConfigureAwait(false))
-        {
-            var entity = MapReaderToEntity<TEntity>(reader, properties, columnMappings);
-            results.Add(entity);
-        }
-
-        return results;
-    }
-
     #endregion
-
-    #region IDisposable 实现
-
-    public void Dispose()
-    {
-        Dispose(true);
-        GC.SuppressFinalize(this);
-    }
-
-    protected virtual void Dispose(bool disposing)
-    {
-        if (!_disposed)
-        {
-            if (disposing)
-            {
-                try
-                {
-                    // 输出性能报告（如果已启用）
-                    if (_configuration.EnablePerformanceMonitoring)
-                    {
-                        var report = QueryPerformanceMonitor.GenerateReport();
-                        _logger.Info($"DuckDB性能报告: 总查询数: {report.TotalQueries}, " +
-                                     $"成功率: {report.OverallSuccessRate:F2}%, " +
-                                     $"平均耗时: {report.AverageQueryTimeMs:F2}ms");
-                    }
-
-                    // 清理预编译语句缓存
-                    foreach (var statementWrapper in _statementCache.Values)
-                    {
-                        statementWrapper.Dispose();
-                    }
-
-                    _statementCache.Clear();
-
-                    // 输出缓存统计
-                    _logger.Info($"DuckDB元数据缓存统计: {DuckDBMetadataCache.GetStatistics()}");
-
-                    // 释放连接
-                    if (_configuration.UseConnectionPool && _pooledConnection != null)
-                    {
-                        // 返回连接到池
-                        _connectionPool?.ReleaseConnection(_pooledConnection);
-                        _pooledConnection = null;
-                        _connection = null;
-                        _logger.Debug("DuckDB连接已释放回连接池");
-                    }
-                    else if (_connection != null)
-                    {
-                        // 直接关闭连接
-                        _connection?.Close();
-                        _connection?.Dispose();
-                        _connection = null;
-                        _logger.Debug("DuckDB连接资源已释放");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    _logger.Error($"释放DuckDB连接资源时出错: {ex.Message}", ex);
-                }
-            }
-
-            _disposed = true;
-        }
-    }
-
-    ~DuckDBFileQueryProvider()
-    {
-        Dispose(false);
-    }
-
-    #endregion
-}
-
-// 列属性特性
-public class ColumnAttribute : Attribute
-{
-    public string Name { get; }
-
-    public ColumnAttribute(string name)
-    {
-        Name = name;
-    }
-}
-
-// 未映射特性
-public class NotMappedAttribute : Attribute
-{
 }
