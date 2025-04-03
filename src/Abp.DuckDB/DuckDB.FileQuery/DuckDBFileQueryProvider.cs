@@ -2,82 +2,19 @@
 using System.Linq.Expressions;
 using Abp.Dependency;
 using Castle.Core.Logging;
-using DuckDB.NET.Data;
 
 namespace Abp.DuckDB.FileQuery;
 
 /// <summary>
 /// DuckDB文件查询提供程序实现
 /// </summary>
-public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQueryProvider, IDuckDBPerformanceMonitor, ITransientDependency
+public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQueryProvider, ITransientDependency
 {
     #region 构造函数
 
     public DuckDBFileQueryProvider(ILogger logger)
         : base(logger)
     {
-    }
-
-    #endregion
-
-    #region IDuckDBPerformanceMonitor 实现
-
-    /// <summary>
-    /// 分析查询计划
-    /// </summary>
-    public async Task<string> AnalyzeQueryPlanAsync(string sql)
-    {
-        using var command = _connection.CreateCommand();
-        command.CommandText = $"EXPLAIN {sql}";
-
-        if (_configuration.LogQueryPlans)
-        {
-            var plan = (string)await command.ExecuteScalarAsync();
-            _logger.Debug($"查询计划: {plan}");
-            return plan;
-        }
-
-        return (string)await command.ExecuteScalarAsync();
-    }
-
-    /// <summary>
-    /// 获取性能报告
-    /// </summary>
-    public QueryPerformanceReport GetPerformanceReport()
-    {
-        return QueryPerformanceMonitor.GenerateReport();
-    }
-
-    /// <summary>
-    /// 获取查询类型的性能指标
-    /// </summary>
-    public QueryPerformanceMetrics GetMetricsForQueryType(string queryType)
-    {
-        return QueryPerformanceMonitor.GetMetricsForQueryType(queryType);
-    }
-
-    /// <summary>
-    /// 重置性能指标
-    /// </summary>
-    public void ResetPerformanceMetrics()
-    {
-        QueryPerformanceMonitor.ResetMetrics();
-    }
-
-    /// <summary>
-    /// 获取最近的查询执行日志
-    /// </summary>
-    public List<QueryExecutionLog> GetRecentExecutions(int count = 100)
-    {
-        return QueryPerformanceMonitor.GetRecentExecutions(count);
-    }
-
-    /// <summary>
-    /// 清除最近的执行日志
-    /// </summary>
-    public void ClearExecutionLogs()
-    {
-        QueryPerformanceMonitor.ClearExecutionLogs();
     }
 
     #endregion
@@ -115,20 +52,6 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
         catch (Exception ex)
         {
             _logger.Error($"查询DuckDB数据失败: {ex.Message}", ex);
-
-            // 记录查询失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    "Query",
-                    $"查询失败: {ex.Message}",
-                    filePaths.Count(),
-                    0,
-                    0,
-                    false,
-                    ex);
-            }
-
             throw;
         }
     }
@@ -219,7 +142,7 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
             // 记录性能指标
             if (_configuration.EnablePerformanceMonitoring)
             {
-                QueryPerformanceMonitor.RecordQueryExecution(
+                _performanceMonitor.RecordQueryExecution(
                     "QueryStream",
                     sql,
                     filePaths.Count(),
@@ -245,20 +168,6 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
         catch (Exception ex)
         {
             _logger.Error($"流式查询DuckDB数据失败: {ex.Message}", ex);
-
-            // 记录查询失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    "QueryStream",
-                    $"流式查询失败: {ex.Message}",
-                    filePaths.Count(),
-                    0,
-                    0,
-                    false,
-                    ex);
-            }
-
             throw;
         }
     }
@@ -339,7 +248,7 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
             // 记录性能指标
             if (_configuration.EnablePerformanceMonitoring)
             {
-                QueryPerformanceMonitor.RecordQueryExecution(
+                _performanceMonitor.RecordQueryExecution(
                     "QueryStreamEnumerable",
                     sql,
                     filePaths.Count(),
@@ -410,7 +319,7 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
             if (_configuration.EnablePerformanceMonitoring)
             {
                 int totalResults = results.Values.Sum(v => v.Count);
-                QueryPerformanceMonitor.RecordQueryExecution(
+                _performanceMonitor.RecordQueryExecution(
                     "BatchQuery",
                     string.Join("; ", queryScripts),
                     filePaths.Count(),
@@ -428,20 +337,6 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
         {
             stopwatch.Stop();
             _logger.Error($"批量查询DuckDB数据失败: {ex.Message}", ex);
-
-            // 记录失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    "BatchQuery",
-                    "批量查询失败",
-                    filePaths.Count(),
-                    0,
-                    stopwatch.ElapsedMilliseconds,
-                    false,
-                    ex);
-            }
-
             throw;
         }
     }
@@ -565,7 +460,7 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
             // 记录性能指标
             if (_configuration.EnablePerformanceMonitoring)
             {
-                QueryPerformanceMonitor.RecordQueryExecution(
+                _performanceMonitor.RecordQueryExecution(
                     "MultipleMetrics",
                     sql,
                     filePaths.Count(),
@@ -585,20 +480,6 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
         {
             stopwatch.Stop();
             _logger.Error($"获取多个指标失败: {ex.Message}", ex);
-
-            // 记录失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    "MultipleMetrics",
-                    "多指标查询失败",
-                    filePaths.Count(),
-                    0,
-                    stopwatch.ElapsedMilliseconds,
-                    false,
-                    ex);
-            }
-
             throw;
         }
     }
@@ -699,7 +580,7 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
             // 记录性能指标
             if (_configuration.EnablePerformanceMonitoring)
             {
-                QueryPerformanceMonitor.RecordQueryExecution(
+                _performanceMonitor.RecordQueryExecution(
                     "QueryPaged",
                     $"Count: {countSql}; Page: {pagingSql}",
                     filePaths.Count(),
@@ -722,20 +603,6 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
         catch (Exception ex)
         {
             _logger.Error($"分页查询DuckDB数据失败: {ex.Message}", ex);
-
-            // 记录失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    "QueryPaged",
-                    "分页查询失败",
-                    filePaths.Count(),
-                    0,
-                    0,
-                    false,
-                    ex);
-            }
-
             throw;
         }
     }
@@ -781,20 +648,6 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
         catch (Exception ex)
         {
             _logger.Error($"统计DuckDB数据失败: {ex.Message}", ex);
-
-            // 记录失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    "Count",
-                    "统计查询失败",
-                    filePaths.Count(),
-                    0,
-                    0,
-                    false,
-                    ex);
-            }
-
             throw;
         }
     }
@@ -854,20 +707,6 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
         catch (Exception ex)
         {
             _logger.Error($"求和DuckDB数据失败: {ex.Message}", ex);
-
-            // 记录失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    "Sum",
-                    "求和查询失败",
-                    filePaths.Count(),
-                    0,
-                    0,
-                    false,
-                    ex);
-            }
-
             throw;
         }
     }
@@ -927,20 +766,6 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
         catch (Exception ex)
         {
             _logger.Error($"求平均值DuckDB数据失败: {ex.Message}", ex);
-
-            // 记录失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    "Avg",
-                    "求平均值查询失败",
-                    filePaths.Count(),
-                    0,
-                    0,
-                    false,
-                    ex);
-            }
-
             throw;
         }
     }
@@ -1000,20 +825,6 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
         catch (Exception ex)
         {
             _logger.Error($"求最小值DuckDB数据失败: {ex.Message}", ex);
-
-            // 记录失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    "Min",
-                    "求最小值查询失败",
-                    filePaths.Count(),
-                    0,
-                    0,
-                    false,
-                    ex);
-            }
-
             throw;
         }
     }
@@ -1073,20 +884,6 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
         catch (Exception ex)
         {
             _logger.Error($"求最大值DuckDB数据失败: {ex.Message}", ex);
-
-            // 记录失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    "Max",
-                    "求最大值查询失败",
-                    filePaths.Count(),
-                    0,
-                    0,
-                    false,
-                    ex);
-            }
-
             throw;
         }
     }
@@ -1094,6 +891,18 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
     #endregion
 
     #region 文件SQL构建
+
+    /// <summary>
+    /// 验证文件路径
+    /// </summary>
+    private void ValidateFilePaths(IEnumerable<string> filePaths)
+    {
+        if (filePaths == null)
+            throw new ArgumentNullException(nameof(filePaths));
+
+        if (!filePaths.Any())
+            throw new ArgumentException("必须提供至少一个文件路径", nameof(filePaths));
+    }
 
     /// <summary>
     /// 直接构建查询SQL，不使用参数化
@@ -1198,207 +1007,36 @@ public class DuckDBFileQueryProvider : DuckDBQueryProviderBase, IDuckDBFileQuery
 
         // 添加分页
         sql += $" LIMIT {limit} OFFSET {offset}";
+
         return sql;
     }
 
     /// <summary>
-    /// 构建Parquet源子句
+    /// 构建Parquet数据源子句
     /// </summary>
     private string BuildParquetSourceClause(IEnumerable<string> filePaths)
     {
-        var escapedPaths = filePaths.Select(p => $"'{p.Replace("'", "''")}'");
-        string pathList = string.Join(", ", escapedPaths);
-        return $"read_parquet([{pathList}])";
-    }
-
-    #endregion
-
-    #region 文件查询辅助方法
-
-    /// <summary>
-    /// 验证文件路径列表
-    /// </summary>
-    private void ValidateFilePaths(IEnumerable<string> filePaths)
-    {
-        if (filePaths == null || !filePaths.Any())
-            throw new ArgumentException("必须提供至少一个文件路径", nameof(filePaths));
-    }
-
-    /// <summary>
-    /// 带指标收集的查询执行方法
-    /// </summary>
-    private async Task<T> ExecuteQueryWithMetricsAsync<T>(
-        Func<Task<T>> queryFunc,
-        string queryType,
-        string sql,
-        int filesCount)
-    {
-        var stopwatch = Stopwatch.StartNew();
-        int resultCount = -1;
-
-        try
+        // 使用文件名生成SQL UNION ALL查询
+        if (filePaths.Count() == 1)
         {
-            T result = await queryFunc();
-            stopwatch.Stop();
-
-            // 计算结果集大小（如果可能）
-            if (result is ICollection<object> collection)
-                resultCount = collection.Count;
-            else if (result is int intValue)
-                resultCount = 1;
-            else if (result is IEnumerable<object> enumerable)
-                resultCount = enumerable.Count();
-
-            // 收集性能指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    queryType,
-                    sql,
-                    filesCount,
-                    resultCount >= 0 ? resultCount : 0,
-                    stopwatch.ElapsedMilliseconds,
-                    true);
-
-                // 检查是否是慢查询
-                if (_configuration.LogSlowQueries && stopwatch.ElapsedMilliseconds > _configuration.SlowQueryThresholdMs)
-                {
-                    _logger.Warn($"[慢查询] {queryType}查询耗时: {stopwatch.ElapsedMilliseconds}ms, SQL: {sql}");
-                }
-            }
-
-            // 记录基本指标
-            _logger.Info($"[DuckDB指标] 类型: {queryType} | 文件数: {filesCount} | " +
-                         $"结果数: {(resultCount >= 0 ? resultCount.ToString() : "N/A")} | " +
-                         $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
-
-            _logger.Debug($"[DuckDB指标SQL] {sql}");
-
-            return result;
+            // 单文件情况
+            return $"read_parquet('{EscapePath(filePaths.First())}')";
         }
-        catch (Exception ex)
+        else
         {
-            stopwatch.Stop();
-
-            // 收集失败指标
-            if (_configuration.EnablePerformanceMonitoring)
-            {
-                QueryPerformanceMonitor.RecordQueryExecution(
-                    queryType,
-                    sql,
-                    filesCount,
-                    0,
-                    stopwatch.ElapsedMilliseconds,
-                    false,
-                    ex);
-            }
-
-            _logger.Error($"[DuckDB指标错误] 类型: {queryType} | 文件数: {filesCount} | " +
-                          $"执行时间: {stopwatch.ElapsedMilliseconds}ms | 错误: {ex.Message}");
-
-            // 自动重试功能
-            if (_configuration.AutoRetryFailedQueries && IsRetryableException(ex))
-            {
-                return await RetryOperationAsync(queryFunc, queryType, sql, filesCount);
-            }
-
-            throw;
+            // 多文件情况，使用列表语法
+            var fileList = string.Join(", ", filePaths.Select(p => $"'{EscapePath(p)}'"));
+            return $"read_parquet([{fileList}])";
         }
     }
 
     /// <summary>
-    /// 判断异常是否可以重试
+    /// 转义路径中的特殊字符
     /// </summary>
-    private bool IsRetryableException(Exception ex)
+    private string EscapePath(string path)
     {
-        // 识别可以重试的异常类型
-        return ex is DuckDBException duckEx &&
-               (duckEx.Message.Contains("timeout") ||
-                duckEx.Message.Contains("connection") ||
-                duckEx.Message.Contains("temporary"));
-    }
-
-    /// <summary>
-    /// 重试操作
-    /// </summary>
-    private async Task<T> RetryOperationAsync<T>(
-        Func<Task<T>> operation,
-        string queryType,
-        string sql,
-        int filesCount)
-    {
-        int retryCount = 0;
-        Exception lastException = null;
-
-        while (retryCount < _configuration.MaxRetryCount)
-        {
-            retryCount++;
-
-            try
-            {
-                // 等待一段时间后重试
-                await Task.Delay(TimeSpan.FromMilliseconds(
-                    _configuration.RetryInterval.TotalMilliseconds * Math.Pow(2, retryCount - 1))); // 指数退避
-
-                _logger.Warn($"[DuckDB重试] 查询类型: {queryType} | 第 {retryCount} 次重试...");
-
-                var stopwatch = Stopwatch.StartNew();
-                T result = await operation();
-                stopwatch.Stop();
-
-                _logger.Info($"[DuckDB重试成功] 查询类型: {queryType} | 重试次数: {retryCount} | " +
-                             $"执行时间: {stopwatch.ElapsedMilliseconds}ms");
-
-                // 记录重试成功指标
-                if (_configuration.EnablePerformanceMonitoring)
-                {
-                    int resultCount = -1;
-                    if (result is ICollection<object> collection)
-                        resultCount = collection.Count;
-                    else if (result is int intValue)
-                        resultCount = 1;
-
-                    QueryPerformanceMonitor.RecordQueryExecution(
-                        $"{queryType}Retry",
-                        sql,
-                        filesCount,
-                        resultCount >= 0 ? resultCount : 0,
-                        stopwatch.ElapsedMilliseconds,
-                        true);
-                }
-
-                return result;
-            }
-            catch (Exception ex)
-            {
-                lastException = ex;
-                _logger.Warn($"[DuckDB重试失败] 查询类型: {queryType} | 重试次数: {retryCount} | 错误: {ex.Message}");
-
-                // 记录重试失败指标
-                if (_configuration.EnablePerformanceMonitoring)
-                {
-                    QueryPerformanceMonitor.RecordQueryExecution(
-                        $"{queryType}RetryFailed",
-                        sql,
-                        filesCount,
-                        0,
-                        0,
-                        false,
-                        ex);
-                }
-
-                // 如果不是可重试异常，则中断重试
-                if (!IsRetryableException(ex))
-                {
-                    _logger.Error($"[DuckDB重试终止] 查询类型: {queryType} | 遇到不可重试的异常");
-                    break;
-                }
-            }
-        }
-
-        // 所有重试都失败
-        _logger.Error($"[DuckDB重试耗尽] 查询类型: {queryType} | 已达到最大重试次数: {_configuration.MaxRetryCount}");
-        throw new Exception($"执行查询失败，已重试 {retryCount} 次", lastException);
+        // 避免SQL注入和特殊字符问题
+        return path.Replace("'", "''");
     }
 
     #endregion

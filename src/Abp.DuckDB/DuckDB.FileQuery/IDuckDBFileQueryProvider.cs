@@ -5,7 +5,7 @@ namespace Abp.DuckDB.FileQuery;
 /// <summary>
 /// DuckDB文件查询提供程序接口
 /// </summary>
-public interface IDuckDBFileQueryProvider : IDuckDBQueryProvider, IDuckDBPerformanceMonitor
+public interface IDuckDBFileQueryProvider : IDuckDBQueryProvider
 {
     /// <summary>
     /// 查询数据

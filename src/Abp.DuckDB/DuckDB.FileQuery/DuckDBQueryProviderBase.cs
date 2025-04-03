@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Linq.Expressions;
 using System.Reflection;
 using Castle.Core.Logging;
@@ -13,10 +14,13 @@ public abstract class DuckDBQueryProviderBase : IDuckDBQueryProvider
 {
     #region 私有字段与内部类
 
-    // 连接池相关
-    private static DuckDBConnectionPool _connectionPool;
-    private static readonly object _poolInitLock = new object();
-    private static Timer _maintenanceTimer;
+    // 连接池相关 - 改为实例字段以支持注入
+    private DuckDBConnectionPool _connectionPool;
+    private readonly object _poolInitLock = new object();
+    private Timer _maintenanceTimer;
+
+    // 性能监控相关 - 改为实例字段
+    protected readonly QueryPerformanceMonitor _performanceMonitor = new QueryPerformanceMonitor();
 
     // 连接相关
     protected DuckDBConnection _connection;
@@ -55,10 +59,77 @@ public abstract class DuckDBQueryProviderBase : IDuckDBQueryProvider
 
     #region 构造函数
 
-    protected DuckDBQueryProviderBase(ILogger logger)
+    /// <summary>
+    /// 构造DuckDB查询提供程序
+    /// </summary>
+    /// <param name="logger">日志记录器</param>
+    /// <param name="performanceMonitor">性能监视器，如果为null则创建新实例</param>
+    protected DuckDBQueryProviderBase(ILogger logger, QueryPerformanceMonitor performanceMonitor = null)
     {
         _logger = logger ?? NullLogger.Instance;
         _configuration = DuckDBConfiguration.HighPerformance(); // 使用默认配置
+        _performanceMonitor = performanceMonitor ?? new QueryPerformanceMonitor();
+    }
+
+    #endregion
+
+    #region 连接池管理
+
+    /// <summary>
+    /// 设置外部连接池实例
+    /// </summary>
+    /// <param name="connectionPool">要使用的连接池实例</param>
+    public void SetConnectionPool(DuckDBConnectionPool connectionPool)
+    {
+        if (connectionPool == null)
+            throw new ArgumentNullException(nameof(connectionPool));
+
+        lock (_poolInitLock)
+        {
+            // 如果已有连接池，先停止维护计时器
+            if (_maintenanceTimer != null)
+            {
+                _maintenanceTimer.Dispose();
+                _maintenanceTimer = null;
+            }
+
+            _connectionPool = connectionPool;
+            _logger.Info("已设置外部DuckDB连接池实例");
+
+            // 为新连接池启动维护计时器
+            StartPoolMaintenanceTimer();
+        }
+    }
+
+    /// <summary>
+    /// 启动连接池维护计时器
+    /// </summary>
+    private void StartPoolMaintenanceTimer()
+    {
+        if (_connectionPool != null && _maintenanceTimer == null)
+        {
+            _maintenanceTimer = new Timer(
+                _ => PerformPoolMaintenance(),
+                null,
+                TimeSpan.FromMinutes(5),
+                TimeSpan.FromMinutes(5));
+        }
+    }
+
+    /// <summary>
+    /// 执行连接池维护
+    /// </summary>
+    private void PerformPoolMaintenance()
+    {
+        _connectionPool?.CleanIdleConnections();
+    }
+
+    /// <summary>
+    /// 获取连接池状态信息
+    /// </summary>
+    public PoolStatus GetConnectionPoolStatus()
+    {
+        return _connectionPool?.GetStatus();
     }
 
     #endregion
@@ -101,14 +172,7 @@ public abstract class DuckDBQueryProviderBase : IDuckDBQueryProvider
                 _logger.Info($"DuckDB查询提供程序初始化成功，使用连接池，线程数：{configuration.ThreadCount}，内存限制：{configuration.MemoryLimit}");
 
                 // 初始化维护计时器
-                if (_maintenanceTimer == null)
-                {
-                    _maintenanceTimer = new Timer(
-                        _ => PerformPoolMaintenance(),
-                        null,
-                        TimeSpan.FromMinutes(5),
-                        TimeSpan.FromMinutes(5));
-                }
+                StartPoolMaintenanceTimer();
             }
             else
             {
@@ -174,22 +238,6 @@ public abstract class DuckDBQueryProviderBase : IDuckDBQueryProvider
                 }
             }
         }
-    }
-
-    /// <summary>
-    /// 执行连接池维护
-    /// </summary>
-    private static void PerformPoolMaintenance()
-    {
-        _connectionPool?.CleanIdleConnections();
-    }
-
-    /// <summary>
-    /// 获取连接池状态信息
-    /// </summary>
-    public PoolStatus GetConnectionPoolStatus()
-    {
-        return _connectionPool?.GetStatus();
     }
 
     #endregion
@@ -464,6 +512,76 @@ public abstract class DuckDBQueryProviderBase : IDuckDBQueryProvider
         }
     }
 
+    /// <summary>
+    /// 通用方法：使用性能监控包装执行查询
+    /// </summary>
+    protected async Task<T> ExecuteQueryWithMetricsAsync<T>(
+        Func<Task<T>> queryFunc,
+        string queryType,
+        string sql,
+        int fileCount = 0)
+    {
+        if (!_configuration.EnablePerformanceMonitoring)
+            return await queryFunc();
+
+        var stopwatch = Stopwatch.StartNew();
+        try
+        {
+            var result = await queryFunc();
+            stopwatch.Stop();
+
+            // 计算结果数量（如果适用）
+            int resultCount = GetResultCount(result);
+
+            // 记录查询执行
+            _performanceMonitor.RecordQueryExecution(
+                queryType,
+                sql,
+                fileCount,
+                resultCount,
+                stopwatch.ElapsedMilliseconds,
+                true);
+
+            // 检查是否是慢查询
+            if (_configuration.LogSlowQueries && stopwatch.ElapsedMilliseconds > _configuration.SlowQueryThresholdMs)
+            {
+                _logger.Warn($"[慢查询] {queryType} 查询耗时: {stopwatch.ElapsedMilliseconds}ms, SQL: {sql}");
+            }
+
+            return result;
+        }
+        catch (Exception ex)
+        {
+            stopwatch.Stop();
+
+            // 记录失败的查询
+            _performanceMonitor.RecordQueryExecution(
+                queryType,
+                sql,
+                fileCount,
+                0,
+                stopwatch.ElapsedMilliseconds,
+                false,
+                ex);
+
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// 获取结果数量（根据返回类型）
+    /// </summary>
+    private int GetResultCount<T>(T result)
+    {
+        if (result is ICollection<object> collection)
+            return collection.Count;
+
+        if (result is ValueTuple<ICollection<object>, int> valueTuple)
+            return valueTuple.Item1.Count;
+
+        return 1; // 默认值为1，表示有结果
+    }
+
     #endregion
 
     #region 表达式处理辅助方法
@@ -582,6 +700,68 @@ public abstract class DuckDBQueryProviderBase : IDuckDBQueryProvider
 
     #endregion
 
+    #region IDuckDBPerformanceMonitor 接口实现
+
+    /// <summary>
+    /// 分析查询计划
+    /// </summary>
+    public async Task<string> AnalyzeQueryPlanAsync(string sql)
+    {
+        using var command = _connection.CreateCommand();
+        command.CommandText = $"EXPLAIN {sql}";
+
+        if (_configuration.LogQueryPlans)
+        {
+            var plan = (string)await command.ExecuteScalarAsync();
+            _logger.Debug($"查询计划: {plan}");
+            return plan;
+        }
+
+        return (string)await command.ExecuteScalarAsync();
+    }
+
+    /// <summary>
+    /// 获取性能报告
+    /// </summary>
+    public QueryPerformanceReport GetPerformanceReport()
+    {
+        return _performanceMonitor.GenerateReport();
+    }
+
+    /// <summary>
+    /// 获取查询类型的性能指标
+    /// </summary>
+    public QueryPerformanceMetrics GetMetricsForQueryType(string queryType)
+    {
+        return _performanceMonitor.GetMetricsForQueryType(queryType);
+    }
+
+    /// <summary>
+    /// 重置性能指标
+    /// </summary>
+    public void ResetPerformanceMetrics()
+    {
+        _performanceMonitor.ResetMetrics();
+    }
+
+    /// <summary>
+    /// 获取最近的查询执行日志
+    /// </summary>
+    public List<QueryExecutionLog> GetRecentExecutions(int count = 100)
+    {
+        return _performanceMonitor.GetRecentExecutions(count);
+    }
+
+    /// <summary>
+    /// 清除最近的执行日志
+    /// </summary>
+    public void ClearExecutionLogs()
+    {
+        _performanceMonitor.ClearExecutionLogs();
+    }
+
+    #endregion
+
     #region IDisposable实现
 
     /// <summary>
@@ -591,6 +771,13 @@ public abstract class DuckDBQueryProviderBase : IDuckDBQueryProvider
     {
         if (!_disposed)
         {
+            // 清理维护计时器
+            if (_maintenanceTimer != null)
+            {
+                _maintenanceTimer.Dispose();
+                _maintenanceTimer = null;
+            }
+
             // 清理语句缓存
             foreach (var statement in _statementCache.Values)
             {

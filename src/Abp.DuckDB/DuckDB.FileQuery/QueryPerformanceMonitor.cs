@@ -7,14 +7,14 @@ namespace Abp.DuckDB.FileQuery;
 /// </summary>
 public class QueryPerformanceMonitor
 {
-    private static readonly ConcurrentDictionary<string, QueryPerformanceMetrics> _metricsStore = new();
-    private static readonly ConcurrentQueue<QueryExecutionLog> _recentExecutions = new();
-    private static readonly int _maxRecentExecutions = 1000;
+    private readonly ConcurrentDictionary<string, QueryPerformanceMetrics> _metricsStore = new();
+    private readonly ConcurrentQueue<QueryExecutionLog> _recentExecutions = new();
+    private readonly int _maxRecentExecutions = 1000;
 
     /// <summary>
     /// 记录查询执行性能指标
     /// </summary>
-    public static void RecordQueryExecution(
+    public void RecordQueryExecution(
         string queryType,
         string sql,
         int fileCount,
@@ -95,7 +95,7 @@ public class QueryPerformanceMonitor
     /// <summary>
     /// 获取指定查询类型的性能指标
     /// </summary>
-    public static QueryPerformanceMetrics GetMetricsForQueryType(string queryType)
+    public QueryPerformanceMetrics GetMetricsForQueryType(string queryType)
     {
         _metricsStore.TryGetValue(queryType, out var metrics);
         return metrics;
@@ -104,7 +104,7 @@ public class QueryPerformanceMonitor
     /// <summary>
     /// 获取所有查询类型的性能指标
     /// </summary>
-    public static Dictionary<string, QueryPerformanceMetrics> GetAllMetrics()
+    public Dictionary<string, QueryPerformanceMetrics> GetAllMetrics()
     {
         return _metricsStore.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
     }
@@ -112,7 +112,7 @@ public class QueryPerformanceMonitor
     /// <summary>
     /// 获取最近的查询执行日志
     /// </summary>
-    public static List<QueryExecutionLog> GetRecentExecutions(int count = 100)
+    public List<QueryExecutionLog> GetRecentExecutions(int count = 100)
     {
         return _recentExecutions.Take(Math.Min(count, _recentExecutions.Count)).ToList();
     }
@@ -120,7 +120,7 @@ public class QueryPerformanceMonitor
     /// <summary>
     /// 重置性能指标
     /// </summary>
-    public static void ResetMetrics(string queryType = null)
+    public void ResetMetrics(string queryType = null)
     {
         if (string.IsNullOrEmpty(queryType))
         {
@@ -135,7 +135,7 @@ public class QueryPerformanceMonitor
     /// <summary>
     /// 清除最近的执行日志
     /// </summary>
-    public static void ClearExecutionLogs()
+    public void ClearExecutionLogs()
     {
         while (_recentExecutions.TryDequeue(out _))
         {
@@ -145,7 +145,7 @@ public class QueryPerformanceMonitor
     /// <summary>
     /// 生成性能报告
     /// </summary>
-    public static QueryPerformanceReport GenerateReport()
+    public QueryPerformanceReport GenerateReport()
     {
         var report = new QueryPerformanceReport
         {
