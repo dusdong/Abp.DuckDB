@@ -3,7 +3,7 @@ using System.Data;
 using Castle.Core.Logging;
 using DuckDB.NET.Data;
 
-namespace Abp.DuckDB.FileQuery;
+namespace Abp.DuckDB;
 
 /// <summary>
 /// DuckDB连接池管理器

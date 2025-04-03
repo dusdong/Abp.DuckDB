@@ -1,7 +1,7 @@
 ﻿using System.Collections.Concurrent;
 using System.Reflection;
 
-namespace Abp.DuckDB.FileQuery;
+namespace Abp.DuckDB;
 
 /// <summary>
 /// DuckDB元数据缓存管理器，使用适应性淘汰策略

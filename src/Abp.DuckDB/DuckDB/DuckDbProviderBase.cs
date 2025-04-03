@@ -5,7 +5,7 @@ using System.Reflection;
 using Castle.Core.Logging;
 using DuckDB.NET.Data;
 
-namespace Abp.DuckDB.FileQuery;
+namespace Abp.DuckDB;
 
 /// <summary>
 /// DuckDB查询提供程序基础实现

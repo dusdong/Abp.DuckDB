@@ -1,4 +1,4 @@
-﻿namespace Abp.DuckDB.FileQuery;
+﻿namespace Abp.DuckDB;
 
 /// <summary>
 /// DuckDB配置类，管理DuckDB查询提供程序的所有配置选项

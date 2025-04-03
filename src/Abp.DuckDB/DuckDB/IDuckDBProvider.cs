@@ -1,4 +1,4 @@
-﻿namespace Abp.DuckDB.FileQuery;
+﻿namespace Abp.DuckDB;
 
 /// <summary>
 /// DuckDB 查询提供程序基础接口

@@ -1,6 +1,6 @@
 ﻿using System.Collections.Concurrent;
 
-namespace Abp.DuckDB.FileQuery;
+namespace Abp.DuckDB;
 
 /// <summary>
 /// DuckDB查询性能监控系统，用于收集和分析查询性能指标

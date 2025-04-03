@@ -2,7 +2,7 @@
 using System.Text;
 using Castle.Core.Logging;
 
-namespace Abp.DuckDB.FileQuery;
+namespace Abp.DuckDB;
 
 /// <summary>
 /// 将 C# 表达式树转换为 DuckDB SQL 条件语句的访问器

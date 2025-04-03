@@ -1,4 +1,4 @@
-﻿namespace Abp.DuckDB.FileQuery;
+﻿namespace Abp.DuckDB;
 
 /// <summary>
 /// DuckDB性能监控接口，负责查询性能的监控、统计和分析
