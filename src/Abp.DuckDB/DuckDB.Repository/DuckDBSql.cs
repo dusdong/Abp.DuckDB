@@ -4,7 +4,7 @@ using System.Text;
 using System.Text.RegularExpressions;
 using DuckDB.NET.Data;
 
-namespace Abp.DuckDB;
+namespace Abp.DuckDB.Repository;
 
 /// <summary>
 /// 用于构建 DuckDB 数据库的 SQL 语句，包括插入、更新、删除、查询等操作。

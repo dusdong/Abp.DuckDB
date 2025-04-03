@@ -1,6 +1,6 @@
 ﻿using System.Data.Common;
 
-namespace Abp.DuckDB;
+namespace Abp.DuckDB.Repository;
 
 public static class DbDataReaderExtensions
 {

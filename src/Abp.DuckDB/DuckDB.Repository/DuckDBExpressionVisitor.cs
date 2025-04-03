@@ -1,7 +1,7 @@
 ﻿using System.Linq.Expressions;
 using System.Text;
 
-namespace Abp.DuckDB;
+namespace Abp.DuckDB.Repository;
 
 /// <summary>
 /// 表达式访问器，用于将 LINQ 表达式转换为 SQL WHERE 子句。

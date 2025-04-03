@@ -1,7 +1,7 @@
 ﻿using System.Reflection;
 using System.Text;
 
-namespace Abp.DuckDB;
+namespace Abp.DuckDB.Repository;
 
 /// <summary>
 /// 表创建助手类，用于根据实体类生成创建表的 SQL 脚本。

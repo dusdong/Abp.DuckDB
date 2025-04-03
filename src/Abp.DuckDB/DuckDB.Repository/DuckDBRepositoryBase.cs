@@ -5,7 +5,7 @@ using Castle.Core;
 using Castle.Core.Logging;
 using DuckDB.NET.Data;
 
-namespace Abp.DuckDB;
+namespace Abp.DuckDB.Repository;
 
 /// <summary>
 /// DuckDB 仓储类，封装数据库操作，包括连接管理、事务管理和命令执行。
