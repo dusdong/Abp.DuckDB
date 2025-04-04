@@ -32,78 +32,211 @@ public static class DuckDBTypeConverter
                 targetType = nullableType;
             }
 
-            // 处理枚举类型
+            // 处理特定类型转换
             if (targetType.IsEnum)
             {
-                if (value is string strValue)
-                {
-                    return (TResult)Enum.Parse(targetType, strValue);
-                }
-                else if (value is int || value is long || value is byte || value is short)
-                {
-                    return (TResult)Enum.ToObject(targetType, value);
-                }
+                return (TResult)ConvertToEnum(value, targetType);
             }
 
-            // 处理常见的数值类型
-            if (targetType == typeof(int) || targetType == typeof(int?))
-                return (TResult)(object)Convert.ToInt32(value);
+            if (IsNumericType(targetType))
+            {
+                return (TResult)ConvertToNumericType(value, targetType);
+            }
 
-            if (targetType == typeof(long) || targetType == typeof(long?))
-                return (TResult)(object)Convert.ToInt64(value);
+            if (IsDateTimeType(targetType))
+            {
+                return (TResult)ConvertToDateTimeType(value, targetType);
+            }
 
-            if (targetType == typeof(decimal) || targetType == typeof(decimal?))
-                return (TResult)(object)Convert.ToDecimal(value);
-
-            if (targetType == typeof(double) || targetType == typeof(double?))
-                return (TResult)(object)Convert.ToDouble(value);
-
-            if (targetType == typeof(float) || targetType == typeof(float?))
-                return (TResult)(object)Convert.ToSingle(value);
-
-            if (targetType == typeof(bool) || targetType == typeof(bool?))
-                return (TResult)(object)Convert.ToBoolean(value);
-
-            if (targetType == typeof(DateTime) || targetType == typeof(DateTime?))
-                return (TResult)(object)Convert.ToDateTime(value);
+            if (targetType == typeof(string))
+            {
+                return (TResult)(object)value.ToString();
+            }
 
             if (targetType == typeof(Guid) || targetType == typeof(Guid?))
             {
-                if (value is string strValue)
-                    return (TResult)(object)Guid.Parse(strValue);
-                return (TResult)(object)value;
+                return (TResult)ConvertToGuid(value);
             }
 
-            // 如果是字符串，直接转换
-            if (targetType == typeof(string))
-                return (TResult)(object)value.ToString();
+            if (targetType == typeof(bool) || targetType == typeof(bool?))
+            {
+                return (TResult)ConvertToBoolean(value);
+            }
 
-            // 如果目标类型实现了IConvertible接口，使用正常的转换
-            if (typeof(IConvertible).IsAssignableFrom(targetType))
-                return (TResult)Convert.ChangeType(value, targetType);
-
-            // 原始类型和类型兼容的情况
-            if (value.GetType() == targetType || targetType.IsAssignableFrom(value.GetType()))
-                return (TResult)value;
-
-            // 尝试使用反射进行转换
-            var converter = TypeDescriptor.GetConverter(value.GetType());
-            if (converter != null && converter.CanConvertTo(targetType))
-                return (TResult)converter.ConvertTo(value, targetType);
-
-            converter = TypeDescriptor.GetConverter(targetType);
-            if (converter != null && converter.CanConvertFrom(value.GetType()))
-                return (TResult)converter.ConvertFrom(value);
-
-            // 记录警告并返回默认值
-            logger?.Warn($"无法将类型 {value.GetType().Name} 转换为 {targetType.Name}，返回默认值");
-            return default!;
+            // 通用转换
+            return (TResult)ConvertGenericType(value, targetType, logger);
         }
         catch (Exception ex)
         {
             logger?.Error($"类型转换失败: {ex.Message}, 源类型: {value.GetType().Name}, 目标类型: {targetType.Name}", ex);
             return default!;
         }
+    }
+
+    /// <summary>
+    /// 检查类型是否为数字类型
+    /// </summary>
+    private static bool IsNumericType(Type type)
+    {
+        return type == typeof(byte) || type == typeof(sbyte) ||
+               type == typeof(short) || type == typeof(ushort) ||
+               type == typeof(int) || type == typeof(uint) ||
+               type == typeof(long) || type == typeof(ulong) ||
+               type == typeof(float) || type == typeof(double) ||
+               type == typeof(decimal);
+    }
+
+    /// <summary>
+    /// 检查类型是否为日期时间类型
+    /// </summary>
+    private static bool IsDateTimeType(Type type)
+    {
+        return type == typeof(DateTime) || type == typeof(DateTimeOffset) ||
+               type == typeof(DateOnly) || type == typeof(TimeOnly);
+    }
+
+    /// <summary>
+    /// 将值转换为枚举类型
+    /// </summary>
+    private static object ConvertToEnum(object value, Type enumType)
+    {
+        if (value is string strValue)
+        {
+            return Enum.Parse(enumType, strValue);
+        }
+        else if (value is int || value is long || value is byte || value is short)
+        {
+            return Enum.ToObject(enumType, value);
+        }
+
+        // 尝试转换其他类型值
+        var underlyingValue = Convert.ChangeType(value, Enum.GetUnderlyingType(enumType));
+        return Enum.ToObject(enumType, underlyingValue);
+    }
+
+    /// <summary>
+    /// 将值转换为数值类型
+    /// </summary>
+    private static object ConvertToNumericType(object value, Type targetType)
+    {
+        if (targetType == typeof(int)) return Convert.ToInt32(value);
+        if (targetType == typeof(long)) return Convert.ToInt64(value);
+        if (targetType == typeof(decimal)) return Convert.ToDecimal(value);
+        if (targetType == typeof(double)) return Convert.ToDouble(value);
+        if (targetType == typeof(float)) return Convert.ToSingle(value);
+        if (targetType == typeof(byte)) return Convert.ToByte(value);
+        if (targetType == typeof(sbyte)) return Convert.ToSByte(value);
+        if (targetType == typeof(short)) return Convert.ToInt16(value);
+        if (targetType == typeof(ushort)) return Convert.ToUInt16(value);
+        if (targetType == typeof(uint)) return Convert.ToUInt32(value);
+        if (targetType == typeof(ulong)) return Convert.ToUInt64(value);
+
+        // 默认转换
+        return Convert.ChangeType(value, targetType);
+    }
+
+    /// <summary>
+    /// 将值转换为日期时间类型
+    /// </summary>
+    private static object ConvertToDateTimeType(object value, Type targetType)
+    {
+        if (value is string dateString)
+        {
+            if (targetType == typeof(DateTime))
+                return DateTime.Parse(dateString);
+            if (targetType == typeof(DateTimeOffset))
+                return DateTimeOffset.Parse(dateString);
+            if (targetType == typeof(DateOnly))
+                return DateOnly.Parse(dateString);
+            if (targetType == typeof(TimeOnly))
+                return TimeOnly.Parse(dateString);
+        }
+
+        // 处理从 DateTime 到其他日期时间类型的转换
+        if (value is DateTime dateTime)
+        {
+            if (targetType == typeof(DateTimeOffset))
+                return new DateTimeOffset(dateTime);
+            if (targetType == typeof(DateOnly))
+                return DateOnly.FromDateTime(dateTime);
+            if (targetType == typeof(TimeOnly))
+                return TimeOnly.FromDateTime(dateTime);
+        }
+
+        // 处理从 DateTimeOffset 到其他日期时间类型的转换
+        if (value is DateTimeOffset dateTimeOffset)
+        {
+            if (targetType == typeof(DateTime))
+                return dateTimeOffset.DateTime;
+            if (targetType == typeof(DateOnly))
+                return DateOnly.FromDateTime(dateTimeOffset.DateTime);
+            if (targetType == typeof(TimeOnly))
+                return TimeOnly.FromDateTime(dateTimeOffset.DateTime);
+        }
+
+        // 默认转换
+        return Convert.ChangeType(value, targetType);
+    }
+
+    /// <summary>
+    /// 将值转换为Guid
+    /// </summary>
+    private static object ConvertToGuid(object value)
+    {
+        if (value is string strValue)
+            return Guid.Parse(strValue);
+        if (value is byte[] bytes)
+            return new Guid(bytes);
+        return value; // 假设它已经是一个Guid
+    }
+
+    /// <summary>
+    /// 将值转换为布尔值
+    /// </summary>
+    private static object ConvertToBoolean(object value)
+    {
+        if (value is long longValue)
+            return longValue != 0;
+        if (value is int intValue)
+            return intValue != 0;
+        if (value is string strValue)
+        {
+            if (string.Equals(strValue, "true", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(strValue, "1"))
+                return true;
+            if (string.Equals(strValue, "false", StringComparison.OrdinalIgnoreCase) ||
+                string.Equals(strValue, "0"))
+                return false;
+        }
+
+        return Convert.ToBoolean(value);
+    }
+
+    /// <summary>
+    /// 通用类型转换
+    /// </summary>
+    private static object ConvertGenericType(object value, Type targetType, ILogger logger)
+    {
+        // 如果原始类型和目标类型相同，或目标类型是原始类型的基类
+        if (value.GetType() == targetType || targetType.IsAssignableFrom(value.GetType()))
+            return value;
+
+        // 尝试使用TypeDescriptor进行转换
+        var converter = TypeDescriptor.GetConverter(value.GetType());
+        if (converter != null && converter.CanConvertTo(targetType))
+            return converter.ConvertTo(value, targetType);
+
+        converter = TypeDescriptor.GetConverter(targetType);
+        if (converter != null && converter.CanConvertFrom(value.GetType()))
+            return converter.ConvertFrom(value);
+
+        // 最后尝试使用Convert.ChangeType
+        if (typeof(IConvertible).IsAssignableFrom(targetType))
+            return Convert.ChangeType(value, targetType);
+
+        // 记录警告并返回默认值
+        logger?.Warn($"无法将类型 {value.GetType().Name} 转换为 {targetType.Name}，返回默认值");
+        return null;
     }
 
     /// <summary>
@@ -124,37 +257,45 @@ public static class DuckDBTypeConverter
 
         try
         {
-            // 处理特殊类型
-            if (underlyingType == typeof(Guid) && value is string guidString)
+            // 处理特定类型
+            if (underlyingType.IsEnum)
             {
-                return Guid.Parse(guidString);
+                return ConvertToEnum(value, underlyingType);
             }
-            else if (underlyingType == typeof(DateTime) && value is string dateString)
+
+            if (IsNumericType(underlyingType))
             {
-                return DateTime.Parse(dateString);
+                return ConvertToNumericType(value, underlyingType);
             }
-            else if (underlyingType.IsEnum)
+
+            if (IsDateTimeType(underlyingType))
             {
-                if (value is string enumString)
-                {
-                    return Enum.Parse(underlyingType, enumString, true);
-                }
-                else
-                {
-                    return Enum.ToObject(underlyingType, value);
-                }
+                return ConvertToDateTimeType(value, underlyingType);
             }
-            else if (underlyingType == typeof(bool) && value is long longValue)
+
+            if (underlyingType == typeof(Guid))
             {
-                return longValue != 0;
+                return ConvertToGuid(value);
             }
-            else if (underlyingType == typeof(byte[]) && value is string base64String)
+
+            if (underlyingType == typeof(bool))
+            {
+                return ConvertToBoolean(value);
+            }
+
+            if (underlyingType == typeof(string))
+            {
+                return value.ToString();
+            }
+
+            if (underlyingType == typeof(byte[]) && value is string base64String)
             {
                 return Convert.FromBase64String(base64String);
             }
 
-            // 标准转换
-            return Convert.ChangeType(value, underlyingType);
+            // 通用转换
+            return ConvertGenericType(value, underlyingType, logger) ??
+                   Convert.ChangeType(value, underlyingType);
         }
         catch (Exception ex)
         {
@@ -180,51 +321,24 @@ public static class DuckDBTypeConverter
         {
             var targetType = property.PropertyType;
 
+            // 使用SafeConvert处理转换
+            object convertedValue = null;
+
             // 处理可空类型
             var nullableType = Nullable.GetUnderlyingType(targetType);
             if (nullableType != null)
             {
-                targetType = nullableType;
+                convertedValue = SafeConvert(value, nullableType, logger);
             }
-
-            // 处理枚举类型
-            if (targetType.IsEnum)
+            else
             {
-                if (value is string strValue)
-                {
-                    property.SetValue(entity, Enum.Parse(targetType, strValue));
-                }
-                else
-                {
-                    property.SetValue(entity, Enum.ToObject(targetType, value));
-                }
-
-                return;
+                convertedValue = SafeConvert(value, targetType, logger);
             }
 
-            // 处理常见类型转换
-            if (value is decimal decValue && targetType == typeof(double))
+            if (convertedValue != null)
             {
-                property.SetValue(entity, Convert.ToDouble(decValue));
-                return;
+                property.SetValue(entity, convertedValue);
             }
-
-            if (value is long longValue && targetType == typeof(int))
-            {
-                property.SetValue(entity, Convert.ToInt32(longValue));
-                return;
-            }
-
-            // 使用TypeDescriptor进行高级转换
-            TypeConverter converter = TypeDescriptor.GetConverter(targetType);
-            if (converter != null && converter.CanConvertFrom(value.GetType()))
-            {
-                property.SetValue(entity, converter.ConvertFrom(value));
-                return;
-            }
-
-            // 通用转换
-            property.SetValue(entity, Convert.ChangeType(value, targetType));
         }
         catch (Exception ex)
         {

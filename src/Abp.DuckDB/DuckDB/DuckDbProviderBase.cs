@@ -212,8 +212,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         }
         catch (Exception ex)
         {
-            _logger.Error("初始化DuckDB查询提供程序失败", ex);
-            throw;
+            HandleException("初始化DuckDB查询提供程序", ex);
         }
     }
 
@@ -308,8 +307,8 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
             }
             catch (Exception ex)
             {
-                _logger.Error($"创建预编译语句失败: {ex.Message}, SQL: {key}", ex);
-                throw;
+                HandleException("创建预编译语句", ex, key);
+                throw; // 这里不会执行到，因为HandleException会抛出异常
             }
         });
     }
@@ -489,25 +488,17 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
 
     #endregion
 
-    #region 缓存和反射优化 - 合并重复函数
-
-    // 统一的属性缓存
-    private static readonly ConcurrentDictionary<Type, PropertyInfo[]> _propertyCache =
-        new ConcurrentDictionary<Type, PropertyInfo[]>();
-
-    private static readonly ConcurrentDictionary<Type, string[]> _columnNamesCache =
-        new ConcurrentDictionary<Type, string[]>();
-
-    private static readonly ConcurrentDictionary<string, string> _columnNameCache =
-        new ConcurrentDictionary<string, string>();
+    #region 缓存和反射优化 - 使用统一缓存
 
     /// <summary>
     /// 获取实体属性（使用缓存）
     /// </summary>
     protected PropertyInfo[] GetEntityProperties<TEntity>()
     {
-        return _propertyCache.GetOrAdd(typeof(TEntity), type =>
-            type.GetProperties(BindingFlags.Public | BindingFlags.Instance));
+        return DuckDBMetadataCache.GetOrAddProperties(
+            typeof(TEntity),
+            type => type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+        );
     }
 
     /// <summary>
@@ -515,11 +506,16 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     /// </summary>
     protected string[] GetEntityColumns<TEntity>()
     {
-        return _columnNamesCache.GetOrAdd(typeof(TEntity), type =>
-        {
-            var properties = GetEntityProperties<TEntity>();
-            return properties.Select(p => p.Name).ToArray();
-        });
+        var columns = DuckDBMetadataCache.GetOrAddEntityColumns(
+            typeof(TEntity),
+            type =>
+            {
+                var properties = GetEntityProperties<TEntity>();
+                return properties.Select(p => p.Name).ToList();
+            }
+        );
+
+        return columns.ToArray();
     }
 
     /// <summary>
@@ -530,23 +526,51 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         // 缓存键
         string cacheKey = $"{typeof(TEntity).FullName}_{selector}";
 
-        return _columnNameCache.GetOrAdd(cacheKey, _ =>
+        return DuckDBMetadataCache.GetOrAddExpressionSql(
+            cacheKey,
+            _ =>
+            {
+                // 简单成员表达式直接提取名称
+                if (selector.Body is MemberExpression memberExp)
+                {
+                    return memberExp.Member.Name;
+                }
+
+                // 处理转换表达式
+                if (selector.Body is UnaryExpression unaryExp &&
+                    unaryExp.Operand is MemberExpression memberOperand)
+                {
+                    return memberOperand.Member.Name;
+                }
+
+                throw new ArgumentException($"无法从表达式解析列名: {selector}", nameof(selector));
+            }
+        );
+    }
+
+    /// <summary>
+    /// 统一处理异常
+    /// </summary>
+    /// <param name="operation">操作名称</param>
+    /// <param name="ex">异常</param>
+    /// <param name="sql">相关SQL语句（可选）</param>
+    /// <param name="context">上下文信息（可选）</param>
+    /// <param name="shouldThrow">是否应该抛出异常</param>
+    protected void HandleException(string operation, Exception ex, string sql = null, string context = null, bool shouldThrow = true)
+    {
+        string message = $"{operation}失败: {ex.Message}";
+        if (!string.IsNullOrEmpty(context))
+            message += $", {context}";
+
+        _logger.Error(message, ex);
+
+        if (shouldThrow)
         {
-            // 简单成员表达式直接提取名称
-            if (selector.Body is MemberExpression memberExp)
-            {
-                return memberExp.Member.Name;
-            }
-
-            // 处理转换表达式
-            if (selector.Body is UnaryExpression unaryExp &&
-                unaryExp.Operand is MemberExpression memberOperand)
-            {
-                return memberOperand.Member.Name;
-            }
-
-            throw new ArgumentException($"无法从表达式解析列名: {selector}", nameof(selector));
-        });
+            if (sql != null)
+                throw new DuckDBOperationException(operation, sql, message, ex);
+            else
+                throw new DuckDBOperationException(operation, message, ex);
+        }
     }
 
     /// <summary>
@@ -639,35 +663,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
             return null;
         }
 
-        Type underlyingType = Nullable.GetUnderlyingType(targetType) ?? targetType;
-
-        // 特殊类型转换处理
-        if (underlyingType == typeof(Guid) && value is string stringValue)
-        {
-            return Guid.Parse(stringValue);
-        }
-
-        // 枚举类型处理
-        if (underlyingType.IsEnum)
-        {
-            if (value is string enumString)
-            {
-                return Enum.Parse(underlyingType, enumString);
-            }
-            else
-            {
-                return Enum.ToObject(underlyingType, value);
-            }
-        }
-
-        // 对于DuckDB特有类型进行特殊处理
-        if (value.GetType().Name.StartsWith("DuckDB") && underlyingType != value.GetType())
-        {
-            return DuckDBTypeConverter.SafeConvert(value, underlyingType, _logger);
-        }
-
-        // 常规类型转换
-        return Convert.ChangeType(value, underlyingType);
+        return DuckDBTypeConverter.SafeConvert(value, targetType, _logger);
     }
 
     /// <summary>
@@ -734,16 +730,8 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         }
         catch (Exception ex)
         {
-            string message = $"{operationName}失败: {ex.Message}";
-            if (!string.IsNullOrEmpty(context))
-                message += $", 上下文: {context}";
-
-            _logger.Error(message, ex);
-
-            if (rethrowWrapped)
-                throw new DuckDBOperationException(operationName, message, ex);
-            else
-                throw;
+            HandleException(operationName, ex, null, context, rethrowWrapped);
+            return default; // 这里不会执行到，因为HandleException会抛出异常
         }
     }
 
@@ -768,16 +756,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         }
         catch (Exception ex)
         {
-            string message = $"{operationName}失败: {ex.Message}";
-            if (!string.IsNullOrEmpty(context))
-                message += $", 上下文: {context}";
-
-            _logger.Error(message, ex);
-
-            if (rethrowWrapped)
-                throw new DuckDBOperationException(operationName, message, ex);
-            else
-                throw;
+            HandleException(operationName, ex, null, context, rethrowWrapped);
         }
     }
 
@@ -894,8 +873,8 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         }
         catch (Exception ex)
         {
-            _logger.Error($"执行自定义SQL查询失败: {ex.Message}，SQL语句：{sql}", ex);
-            throw new Exception($"执行自定义SQL查询失败", ex);
+            HandleException("执行自定义SQL查询", ex, sql);
+            return new List<TEntity>(); // 这里不会执行到
         }
     }
 
@@ -1048,7 +1027,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     #endregion
 
     #region IDuckDBPerformanceMonitor 接口实现
-    
+
     /// <summary>
     /// 记录批处理进度
     /// </summary>
@@ -1058,10 +1037,10 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         _performanceMonitor.RecordQueryExecution(
             "BatchProcessing",
             "Streaming batch processed",
-            0,  // 文件数量
-            itemCount,  // 记录数量
-            0,  // 执行时间 - 这里我们只关心记录数
-            true);  // 成功标志
+            0, // 文件数量
+            itemCount, // 记录数量
+            0, // 执行时间 - 这里我们只关心记录数
+            true); // 成功标志
     }
 
     /// <summary>

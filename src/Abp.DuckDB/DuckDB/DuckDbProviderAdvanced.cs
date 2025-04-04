@@ -1,5 +1,4 @@
 ﻿using System.Linq.Expressions;
-using System.Text;
 using Castle.Core.Logging;
 using DuckDB.NET.Data;
 
@@ -41,8 +40,8 @@ public abstract class DuckDbProviderAdvanced : DuckDbProviderBase, IDuckDBProvid
 
         try
         {
-            // 构建SQL查询
-            var sql = BuildVectorizedFilterQuery(tableName, columns, filterValues, resultLimit);
+            // 使用SqlBuilder的实现而不是本地重复实现
+            var sql = _sqlBuilder.BuildVectorizedFilterQuery(tableName, columns, filterValues, resultLimit);
             _logger.Debug($"执行向量化过滤查询: {sql}");
 
             // 执行查询
@@ -53,63 +52,9 @@ public abstract class DuckDbProviderAdvanced : DuckDbProviderBase, IDuckDBProvid
         }
         catch (Exception ex)
         {
-            _logger.Error($"执行向量化过滤查询失败: {ex.Message}", ex);
-            throw new Exception("执行向量化过滤查询失败", ex);
+            HandleException("执行向量化过滤查询", ex, null);
+            throw; // 这里不会执行到，因为HandleException会抛出异常
         }
-    }
-
-    /// <summary>
-    /// 构建向量化过滤查询的SQL
-    /// </summary>
-    protected string BuildVectorizedFilterQuery(
-        string tableName,
-        string[] columns,
-        object[][] filterValues,
-        int resultLimit)
-    {
-        var sb = new StringBuilder();
-        sb.Append($"SELECT * FROM {tableName} WHERE ");
-
-        for (int i = 0; i < columns.Length; i++)
-        {
-            if (i > 0) sb.Append(" AND ");
-
-            sb.Append($"{columns[i]} IN (");
-
-            for (int j = 0; j < filterValues[i].Length; j++)
-            {
-                if (j > 0) sb.Append(", ");
-
-                // 根据值类型进行适当格式化
-                var value = filterValues[i][j];
-                if (value == null)
-                {
-                    sb.Append("NULL");
-                }
-                else if (value is string strValue)
-                {
-                    sb.Append($"'{strValue.Replace("'", "''")}'");
-                }
-                else if (value is DateTime dtValue)
-                {
-                    sb.Append($"'{dtValue:yyyy-MM-dd HH:mm:ss}'");
-                }
-                else
-                {
-                    sb.Append(value.ToString());
-                }
-            }
-
-            sb.Append(")");
-        }
-
-        // 添加限制
-        if (resultLimit > 0)
-        {
-            sb.Append($" LIMIT {resultLimit}");
-        }
-
-        return sb.ToString();
     }
 
     /// <summary>
@@ -134,8 +79,7 @@ public abstract class DuckDbProviderAdvanced : DuckDbProviderBase, IDuckDBProvid
         }
         catch (Exception ex)
         {
-            _logger.Error($"注册自定义函数失败: {ex.Message}", ex);
-            throw;
+            HandleException("注册自定义函数", ex);
         }
     }
 
@@ -177,8 +121,8 @@ public abstract class DuckDbProviderAdvanced : DuckDbProviderBase, IDuckDBProvid
         }
         catch (Exception ex)
         {
-            _logger.Error($"执行非查询SQL语句失败: {ex.Message}，SQL语句：{sql}", ex);
-            throw;
+            HandleException("执行非查询SQL语句", ex, sql);
+            return -1; // 这里不会执行到
         }
     }
 
@@ -213,8 +157,8 @@ public abstract class DuckDbProviderAdvanced : DuckDbProviderBase, IDuckDBProvid
         }
         catch (Exception ex)
         {
-            _logger.Error($"查询Parquet文件失败: {ex.Message}, 文件路径: {parquetFilePath}", ex);
-            throw;
+            HandleException("查询Parquet文件", ex, null, $"文件路径: {parquetFilePath}");
+            return new List<TEntity>(); // 这里不会执行到
         }
     }
 
@@ -273,8 +217,7 @@ public abstract class DuckDbProviderAdvanced : DuckDbProviderBase, IDuckDBProvid
         }
         catch (Exception ex)
         {
-            _logger.Error($"应用DuckDB优化设置失败: {ex.Message}", ex);
-            throw;
+            HandleException("应用DuckDB优化设置", ex);
         }
     }
 
@@ -308,8 +251,8 @@ public abstract class DuckDbProviderAdvanced : DuckDbProviderBase, IDuckDBProvid
         }
         catch (Exception ex)
         {
-            _logger.Error($"执行分页查询失败: {ex.Message}", ex);
-            throw;
+            HandleException("执行分页查询", ex);
+            return new List<TEntity>(); // 这里不会执行到
         }
     }
 
