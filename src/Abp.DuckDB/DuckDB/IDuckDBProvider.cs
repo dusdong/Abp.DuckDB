@@ -50,4 +50,39 @@ public interface IDuckDBProvider : IDuckDBPerformanceMonitor, IDisposable
     /// 获取缓存统计信息
     /// </summary>
     string GetCacheStatistics();
+
+    /// <summary>
+    /// 记录批处理进度
+    /// </summary>
+    void RecordBatchProcessing(int itemCount);
+
+    /// <summary>
+    /// 分析查询计划
+    /// </summary>
+    Task<string> AnalyzeQueryPlanAsync(string sql);
+
+    /// <summary>
+    /// 获取性能报告
+    /// </summary>
+    QueryPerformanceReport GetPerformanceReport();
+
+    /// <summary>
+    /// 获取查询类型的性能指标
+    /// </summary>
+    QueryPerformanceMetrics GetMetricsForQueryType(string queryType);
+
+    /// <summary>
+    /// 重置性能指标
+    /// </summary>
+    void ResetPerformanceMetrics();
+
+    /// <summary>
+    /// 获取最近的查询执行日志
+    /// </summary>
+    List<QueryExecutionLog> GetRecentExecutions(int count = 100);
+
+    /// <summary>
+    /// 清除最近的执行日志
+    /// </summary>
+    void ClearExecutionLogs();
 }

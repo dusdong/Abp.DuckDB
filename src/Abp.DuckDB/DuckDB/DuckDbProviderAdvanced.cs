@@ -10,8 +10,8 @@ namespace Abp.DuckDB;
 /// </summary>
 public abstract class DuckDbProviderAdvanced : DuckDbProviderBase, IDuckDBProviderAdvanced
 {
-    protected DuckDbProviderAdvanced(ILogger logger, QueryPerformanceMonitor performanceMonitor = null)
-        : base(logger, performanceMonitor)
+    protected DuckDbProviderAdvanced(ILogger logger, DuckDBSqlBuilder sqlBuilder, QueryPerformanceMonitor performanceMonitor)
+        : base(logger, sqlBuilder, performanceMonitor)
     {
     }
 
@@ -200,7 +200,7 @@ public abstract class DuckDbProviderAdvanced : DuckDbProviderBase, IDuckDBProvid
                 throw new FileNotFoundException("找不到Parquet文件", parquetFilePath);
 
             // 构建查询语句
-            var whereClause = BuildWhereClause(predicate);
+            var whereClause = _sqlBuilder.BuildWhereClause(predicate);
             var sql = $"SELECT * FROM read_parquet('{parquetFilePath.Replace("'", "''")}'){whereClause}";
 
             _logger.Debug($"直接查询Parquet文件: {parquetFilePath}");
@@ -293,7 +293,7 @@ public abstract class DuckDbProviderAdvanced : DuckDbProviderBase, IDuckDBProvid
         try
         {
             // 构建查询
-            var whereClause = BuildWhereClause(predicate);
+            var whereClause = _sqlBuilder.BuildWhereClause(predicate);
             var orderClause = string.IsNullOrEmpty(orderByColumn)
                 ? string.Empty
                 : $" ORDER BY {orderByColumn} {(ascending ? "ASC" : "DESC")}";
@@ -314,15 +314,93 @@ public abstract class DuckDbProviderAdvanced : DuckDbProviderBase, IDuckDBProvid
     }
 
     /// <summary>
-    /// 从表达式构建WHERE子句
+    /// 通用聚合函数方法 - 合并多个类似函数
     /// </summary>
-    protected string BuildWhereClause(Expression expression)
+    public async Task<TResult> AggregateAsync<TEntity, TResult>(
+        string aggregateFunction,
+        string tableName,
+        Expression<Func<TEntity, object>> selector,
+        Expression<Func<TEntity, bool>> predicate = null,
+        CancellationToken cancellationToken = default)
     {
-        if (expression == null)
-            return string.Empty;
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
 
-        // 注意：这里需要一个实际的表达式解析器来将C#表达式转换为SQL
-        // 以下只是简单示例
-        return " WHERE /* 表达式将在实际实现中转换 */";
+        string columnName = GetColumnName(selector);
+        string whereClause = predicate != null ? _sqlBuilder.BuildWhereClause(predicate) : string.Empty;
+
+        return await ExecuteAggregateAsync<TEntity, TResult>(
+            aggregateFunction,
+            columnName,
+            whereClause,
+            tableName,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// 计算指定列的总和
+    /// </summary>
+    public async Task<TResult> SumAsync<TEntity, TResult>(
+        string tableName,
+        Expression<Func<TEntity, object>> selector,
+        Expression<Func<TEntity, bool>> predicate = null,
+        CancellationToken cancellationToken = default)
+    {
+        return await AggregateAsync<TEntity, TResult>(
+            "SUM",
+            tableName,
+            selector,
+            predicate,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// 计算指定列的平均值
+    /// </summary>
+    public async Task<TResult> AvgAsync<TEntity, TResult>(
+        string tableName,
+        Expression<Func<TEntity, object>> selector,
+        Expression<Func<TEntity, bool>> predicate = null,
+        CancellationToken cancellationToken = default)
+    {
+        return await AggregateAsync<TEntity, TResult>(
+            "AVG",
+            tableName,
+            selector,
+            predicate,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// 计算指定列的最小值
+    /// </summary>
+    public async Task<TResult> MinAsync<TEntity, TResult>(
+        string tableName,
+        Expression<Func<TEntity, object>> selector,
+        Expression<Func<TEntity, bool>> predicate = null,
+        CancellationToken cancellationToken = default)
+    {
+        return await AggregateAsync<TEntity, TResult>(
+            "MIN",
+            tableName,
+            selector,
+            predicate,
+            cancellationToken);
+    }
+
+    /// <summary>
+    /// 计算指定列的最大值
+    /// </summary>
+    public async Task<TResult> MaxAsync<TEntity, TResult>(
+        string tableName,
+        Expression<Func<TEntity, object>> selector,
+        Expression<Func<TEntity, bool>> predicate = null,
+        CancellationToken cancellationToken = default)
+    {
+        return await AggregateAsync<TEntity, TResult>(
+            "MAX",
+            tableName,
+            selector,
+            predicate,
+            cancellationToken);
     }
 }

@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.Data.Common;
 using System.Diagnostics;
 using System.Linq.Expressions;
 using System.Reflection;
@@ -32,6 +33,9 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     // 添加预编译语句缓存
     protected readonly ConcurrentDictionary<string, PreparedStatementWrapper> _statementCache = new();
 
+    // DuckDB SQL构建器
+    protected readonly DuckDBSqlBuilder _sqlBuilder;
+
     /// <summary>
     /// 预编译语句包装器，用于管理预编译语句的生命周期
     /// </summary>
@@ -63,9 +67,11 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     /// 构造DuckDB查询提供程序
     /// </summary>
     /// <param name="logger">日志记录器</param>
+    /// <param name="sqlBuilder">SQL构建器</param>
     /// <param name="performanceMonitor">性能监视器，如果为null则创建新实例</param>
-    protected DuckDbProviderBase(ILogger logger, QueryPerformanceMonitor performanceMonitor = null)
+    protected DuckDbProviderBase(ILogger logger, DuckDBSqlBuilder sqlBuilder, QueryPerformanceMonitor performanceMonitor)
     {
+        _sqlBuilder = sqlBuilder;
         _logger = logger ?? NullLogger.Instance;
         _configuration = DuckDBConfiguration.HighPerformance(); // 使用默认配置
         _performanceMonitor = performanceMonitor ?? new QueryPerformanceMonitor();
@@ -310,7 +316,536 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
 
     #endregion
 
+    #region 通用查询构建方法
+
+    /// <summary>
+    /// 构建查询SQL
+    /// </summary>
+    protected string BuildSelectQuery(
+        string dataSource,
+        string whereClause,
+        IEnumerable<string> selectedColumns = null)
+    {
+        string columns = selectedColumns != null && selectedColumns.Any()
+            ? string.Join(", ", selectedColumns)
+            : "*";
+
+        var sql = $"SELECT {columns} FROM {dataSource}";
+
+        if (!string.IsNullOrEmpty(whereClause))
+        {
+            sql += $" WHERE {whereClause}";
+        }
+
+        return sql;
+    }
+
+    /// <summary>
+    /// 构建COUNT查询
+    /// </summary>
+    protected string BuildCountQuery(string dataSource, string whereClause)
+    {
+        var sql = $"SELECT COUNT(*) FROM {dataSource}";
+
+        if (!string.IsNullOrEmpty(whereClause))
+        {
+            sql += $" WHERE {whereClause}";
+        }
+
+        return sql;
+    }
+
+    /// <summary>
+    /// 执行分页查询
+    /// </summary>
+    protected async Task<(List<TEntity> Items, int TotalCount)> ExecutePagedQueryAsync<TEntity>(
+        string dataSource,
+        string whereClause,
+        int pageIndex,
+        int pageSize,
+        string orderByColumn = null,
+        bool ascending = true,
+        IEnumerable<string> selectedColumns = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+        if (pageIndex < 0) throw new ArgumentException("页码必须大于或等于0", nameof(pageIndex));
+        if (pageSize <= 0) throw new ArgumentException("页大小必须大于0", nameof(pageSize));
+
+        return await ExecuteSafelyAsync(
+            async () =>
+            {
+                // 计算分页参数
+                int offset = pageIndex * pageSize;
+
+                // 构建分页查询
+                string columns = selectedColumns != null && selectedColumns.Any()
+                    ? string.Join(", ", selectedColumns)
+                    : "*";
+
+                var querySql = $"SELECT {columns} FROM {dataSource}";
+                if (!string.IsNullOrEmpty(whereClause))
+                {
+                    querySql += $" WHERE {whereClause}";
+                }
+
+                if (!string.IsNullOrEmpty(orderByColumn))
+                {
+                    querySql += $" ORDER BY {orderByColumn} {(ascending ? "ASC" : "DESC")}";
+                }
+
+                querySql += $" LIMIT {pageSize} OFFSET {offset}";
+
+                // 构建计数查询
+                var countSql = $"SELECT COUNT(*) FROM {dataSource}";
+                if (!string.IsNullOrEmpty(whereClause))
+                {
+                    countSql += $" WHERE {whereClause}";
+                }
+
+                // 并行执行两个查询以提高性能
+                var itemsTask = ExecuteQueryWithMetricsAsync(
+                    () => QueryWithRawSqlAsync<TEntity>(querySql, cancellationToken),
+                    "PagedQuery",
+                    querySql);
+
+                var countTask = ExecuteQueryWithMetricsAsync(
+                    async () =>
+                    {
+                        using var cmd = _connection.CreateCommand();
+                        cmd.CommandText = countSql;
+
+                        if (_configuration.CommandTimeout != TimeSpan.Zero)
+                            cmd.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+
+                        var result = await cmd.ExecuteScalarAsync(cancellationToken);
+                        return DuckDBTypeConverter.SafeConvert<int>(result, _logger);
+                    },
+                    "CountQuery",
+                    countSql);
+
+                // 等待两个任务完成
+                await Task.WhenAll(itemsTask, countTask);
+
+                // 返回结果
+                return (await itemsTask, await countTask);
+            },
+            "执行分页查询",
+            $"数据源: {dataSource}, 页码: {pageIndex}, 每页大小: {pageSize}"
+        );
+    }
+
+    /// <summary>
+    /// 流式查询处理大量数据
+    /// </summary>
+    protected async Task<int> QueryStreamInternalAsync<TEntity>(
+        string dataSource,
+        string whereClause,
+        int batchSize,
+        Func<IEnumerable<TEntity>, Task> processAction,
+        CancellationToken cancellationToken = default)
+    {
+        var sql = BuildSelectQuery(dataSource, whereClause);
+        int totalProcessed = 0;
+
+        using var command = _connection.CreateCommand();
+        command.CommandText = sql;
+
+        if (_configuration.CommandTimeout != TimeSpan.Zero)
+            command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+
+        using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        var properties = GetEntityProperties<TEntity>();
+        var columnMappings = GetColumnMappings(reader, properties);
+
+        var batch = new List<TEntity>(batchSize);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            var entity = MapReaderToEntity<TEntity>(reader, properties, columnMappings);
+            batch.Add(entity);
+            totalProcessed++;
+
+            if (batch.Count >= batchSize)
+            {
+                if (processAction != null)
+                    await processAction(batch);
+
+                batch.Clear();
+            }
+        }
+
+        // 处理最后一批数据
+        if (batch.Count > 0 && processAction != null)
+        {
+            await processAction(batch);
+        }
+
+        return totalProcessed;
+    }
+
+    #endregion
+
+    #region 缓存和反射优化 - 合并重复函数
+
+    // 统一的属性缓存
+    private static readonly ConcurrentDictionary<Type, PropertyInfo[]> _propertyCache =
+        new ConcurrentDictionary<Type, PropertyInfo[]>();
+
+    private static readonly ConcurrentDictionary<Type, string[]> _columnNamesCache =
+        new ConcurrentDictionary<Type, string[]>();
+
+    private static readonly ConcurrentDictionary<string, string> _columnNameCache =
+        new ConcurrentDictionary<string, string>();
+
+    /// <summary>
+    /// 获取实体属性（使用缓存）
+    /// </summary>
+    protected PropertyInfo[] GetEntityProperties<TEntity>()
+    {
+        return _propertyCache.GetOrAdd(typeof(TEntity), type =>
+            type.GetProperties(BindingFlags.Public | BindingFlags.Instance));
+    }
+
+    /// <summary>
+    /// 获取实体列名（使用缓存）
+    /// </summary>
+    protected string[] GetEntityColumns<TEntity>()
+    {
+        return _columnNamesCache.GetOrAdd(typeof(TEntity), type =>
+        {
+            var properties = GetEntityProperties<TEntity>();
+            return properties.Select(p => p.Name).ToArray();
+        });
+    }
+
+    /// <summary>
+    /// 从表达式获取列名
+    /// </summary>
+    protected string GetColumnName<TEntity, TProperty>(Expression<Func<TEntity, TProperty>> selector)
+    {
+        // 缓存键
+        string cacheKey = $"{typeof(TEntity).FullName}_{selector}";
+
+        return _columnNameCache.GetOrAdd(cacheKey, _ =>
+        {
+            // 简单成员表达式直接提取名称
+            if (selector.Body is MemberExpression memberExp)
+            {
+                return memberExp.Member.Name;
+            }
+
+            // 处理转换表达式
+            if (selector.Body is UnaryExpression unaryExp &&
+                unaryExp.Operand is MemberExpression memberOperand)
+            {
+                return memberOperand.Member.Name;
+            }
+
+            throw new ArgumentException($"无法从表达式解析列名: {selector}", nameof(selector));
+        });
+    }
+
+    /// <summary>
+    /// 获取数据库列名到实体属性的映射
+    /// </summary>
+    /// <param name="reader">数据库读取器</param>
+    /// <param name="properties">实体属性数组</param>
+    /// <returns>列名到属性索引的映射字典</returns>
+    protected Dictionary<string, int> GetColumnMappings(DbDataReader reader, PropertyInfo[] properties)
+    {
+        var columnMappings = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        // 创建字段名到索引的映射
+        for (int i = 0; i < reader.FieldCount; i++)
+        {
+            string columnName = reader.GetName(i);
+
+            // 查找匹配的属性
+            for (int j = 0; j < properties.Length; j++)
+            {
+                // 检查精确匹配
+                if (string.Equals(properties[j].Name, columnName, StringComparison.OrdinalIgnoreCase))
+                {
+                    columnMappings[columnName] = j;
+                    break;
+                }
+            }
+        }
+
+        return columnMappings;
+    }
+
+    /// <summary>
+    /// 将数据库读取器数据映射到实体
+    /// </summary>
+    /// <typeparam name="TEntity">实体类型</typeparam>
+    /// <param name="reader">数据库读取器</param>
+    /// <param name="properties">实体属性数组</param>
+    /// <param name="columnMappings">列名到属性索引的映射</param>
+    /// <returns>映射后的实体对象</returns>
+    protected TEntity MapReaderToEntity<TEntity>(
+        DbDataReader reader,
+        PropertyInfo[] properties,
+        Dictionary<string, int> columnMappings)
+    {
+        // 创建实体实例
+        var entity = Activator.CreateInstance<TEntity>();
+
+        // 遍历所有列并设置属性值
+        for (int i = 0; i < reader.FieldCount; i++)
+        {
+            string columnName = reader.GetName(i);
+
+            // 检查是否有对应的属性映射
+            if (columnMappings.TryGetValue(columnName, out int propertyIndex))
+            {
+                var property = properties[propertyIndex];
+                object value = reader.IsDBNull(i) ? null : reader.GetValue(i);
+
+                if (value != null || property.PropertyType.IsNullable())
+                {
+                    try
+                    {
+                        // 将值转换为属性类型并设置
+                        var convertedValue = ConvertValueToPropertyType(value, property.PropertyType);
+                        property.SetValue(entity, convertedValue);
+                    }
+                    catch (Exception ex)
+                    {
+                        // 记录错误但继续处理，避免单个属性问题导致整个实体失败
+                        _logger.Warn($"设置属性 {property.Name} 值失败: {ex.Message}", ex);
+                    }
+                }
+            }
+        }
+
+        return entity;
+    }
+
+    /// <summary>
+    /// 将值转换为指定的属性类型
+    /// </summary>
+    /// <param name="value">原始值</param>
+    /// <param name="targetType">目标类型</param>
+    /// <returns>转换后的值</returns>
+    protected object ConvertValueToPropertyType(object value, Type targetType)
+    {
+        if (value == null || value == DBNull.Value)
+        {
+            return null;
+        }
+
+        Type underlyingType = Nullable.GetUnderlyingType(targetType) ?? targetType;
+
+        // 特殊类型转换处理
+        if (underlyingType == typeof(Guid) && value is string stringValue)
+        {
+            return Guid.Parse(stringValue);
+        }
+
+        // 枚举类型处理
+        if (underlyingType.IsEnum)
+        {
+            if (value is string enumString)
+            {
+                return Enum.Parse(underlyingType, enumString);
+            }
+            else
+            {
+                return Enum.ToObject(underlyingType, value);
+            }
+        }
+
+        // 对于DuckDB特有类型进行特殊处理
+        if (value.GetType().Name.StartsWith("DuckDB") && underlyingType != value.GetType())
+        {
+            return DuckDBTypeConverter.SafeConvert(value, underlyingType, _logger);
+        }
+
+        // 常规类型转换
+        return Convert.ChangeType(value, underlyingType);
+    }
+
+    /// <summary>
+    /// 使用原始SQL执行查询
+    /// </summary>
+    protected async Task<List<TEntity>> QueryWithRawSqlAsync<TEntity>(string sql, CancellationToken cancellationToken = default)
+    {
+        var results = new List<TEntity>();
+
+        using var command = _connection.CreateCommand();
+        command.CommandText = sql;
+
+        if (_configuration.CommandTimeout != TimeSpan.Zero)
+            command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+
+        using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        var properties = GetEntityProperties<TEntity>();
+        var columnMappings = GetColumnMappings(reader, properties);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var entity = MapReaderToEntity<TEntity>(reader, properties, columnMappings);
+            results.Add(entity);
+        }
+
+        return results;
+    }
+
+    /// <summary>
+    /// 获取列名从属性
+    /// </summary>
+    protected string GetColumnNameFromProperty(PropertyInfo property)
+    {
+        // 这里可以扩展以支持自定义列名特性
+        // 例如 [Column("custom_name")]
+        return property.Name;
+    }
+
+    #endregion
+
     #region 通用查询执行
+
+    /// <summary>
+    /// 安全执行操作，统一处理异常
+    /// </summary>
+    /// <typeparam name="T">返回类型</typeparam>
+    /// <param name="action">要执行的操作</param>
+    /// <param name="operationName">操作名称，用于日志和错误消息</param>
+    /// <param name="context">上下文信息，可选</param>
+    /// <param name="rethrowWrapped">是否将异常包装后重新抛出，默认为true</param>
+    /// <returns>操作结果</returns>
+    protected async Task<T> ExecuteSafelyAsync<T>(
+        Func<Task<T>> action,
+        string operationName,
+        string context = null,
+        bool rethrowWrapped = true)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+
+        try
+        {
+            return await action();
+        }
+        catch (Exception ex)
+        {
+            string message = $"{operationName}失败: {ex.Message}";
+            if (!string.IsNullOrEmpty(context))
+                message += $", 上下文: {context}";
+
+            _logger.Error(message, ex);
+
+            if (rethrowWrapped)
+                throw new DuckDBOperationException(operationName, message, ex);
+            else
+                throw;
+        }
+    }
+
+    /// <summary>
+    /// 安全执行无返回值操作，统一处理异常
+    /// </summary>
+    /// <param name="action">要执行的操作</param>
+    /// <param name="operationName">操作名称，用于日志和错误消息</param>
+    /// <param name="context">上下文信息，可选</param>
+    /// <param name="rethrowWrapped">是否将异常包装后重新抛出，默认为true</param>
+    protected async Task ExecuteSafelyAsync(
+        Func<Task> action,
+        string operationName,
+        string context = null,
+        bool rethrowWrapped = true)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+
+        try
+        {
+            await action();
+        }
+        catch (Exception ex)
+        {
+            string message = $"{operationName}失败: {ex.Message}";
+            if (!string.IsNullOrEmpty(context))
+                message += $", 上下文: {context}";
+
+            _logger.Error(message, ex);
+
+            if (rethrowWrapped)
+                throw new DuckDBOperationException(operationName, message, ex);
+            else
+                throw;
+        }
+    }
+
+    /// <summary>
+    /// 执行聚合查询，用于SUM, AVG, MIN, MAX等操作
+    /// </summary>
+    /// <typeparam name="TEntity">实体类型</typeparam>
+    /// <typeparam name="TResult">聚合结果类型</typeparam>
+    /// <param name="aggregateFunction">聚合函数名称 (SUM, AVG, MIN, MAX等)</param>
+    /// <param name="columnName">要聚合的列名</param>
+    /// <param name="whereClause">WHERE子句(不包含WHERE关键字)</param>
+    /// <param name="dataSource">数据源SQL片段</param>
+    /// <param name="cancellationToken">取消令牌</param>
+    /// <returns>聚合结果</returns>
+    protected async Task<TResult> ExecuteAggregateAsync<TEntity, TResult>(
+        string aggregateFunction,
+        string columnName,
+        string whereClause,
+        string dataSource,
+        CancellationToken cancellationToken = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+
+        // 构建聚合函数表达式
+        string aggregateExpression = $"{aggregateFunction}({columnName})";
+
+        // 构建SQL
+        var sql = $"SELECT {aggregateExpression} FROM {dataSource}";
+        if (!string.IsNullOrEmpty(whereClause))
+        {
+            sql += $" WHERE {whereClause}";
+        }
+
+        return await ExecuteQueryWithMetricsAsync(
+            async () =>
+            {
+                using var command = _connection.CreateCommand();
+                command.CommandText = sql;
+
+                if (_configuration.CommandTimeout != TimeSpan.Zero)
+                    command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+
+                var result = await command.ExecuteScalarAsync(cancellationToken);
+                return DuckDBTypeConverter.SafeConvert<TResult>(result, _logger);
+            },
+            $"{aggregateFunction}Query",
+            sql);
+    }
+
+    /// <summary>
+    /// 执行聚合查询，基于表达式选择器
+    /// </summary>
+    protected async Task<TResult> ExecuteAggregateAsync<TEntity, TResult, TProperty>(
+        string aggregateFunction,
+        Expression<Func<TEntity, TProperty>> selector,
+        string whereClause,
+        string dataSource,
+        CancellationToken cancellationToken = default)
+    {
+        // 从表达式提取列名
+        string columnName = GetColumnName(selector);
+        return await ExecuteAggregateAsync<TEntity, TResult>(
+            aggregateFunction,
+            columnName,
+            whereClause,
+            dataSource,
+            cancellationToken);
+    }
 
     /// <summary>
     /// 通过自定义SQL查询数据
@@ -344,171 +879,23 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
                 }
             }
 
-            return await ExecuteReaderAsync<TEntity>(command).ConfigureAwait(false);
+            using var reader = await command.ExecuteReaderAsync();
+            var results = new List<TEntity>();
+            var properties = GetEntityProperties<TEntity>();
+            var columnMappings = GetColumnMappings(reader, properties);
+
+            while (await reader.ReadAsync())
+            {
+                var entity = MapReaderToEntity<TEntity>(reader, properties, columnMappings);
+                results.Add(entity);
+            }
+
+            return results;
         }
         catch (Exception ex)
         {
             _logger.Error($"执行自定义SQL查询失败: {ex.Message}，SQL语句：{sql}", ex);
             throw new Exception($"执行自定义SQL查询失败", ex);
-        }
-    }
-
-    /// <summary>
-    /// 执行读取器查询并转换为实体列表
-    /// </summary>
-    protected async Task<List<TEntity>> ExecuteReaderAsync<TEntity>(DuckDBCommand command)
-    {
-        var result = new List<TEntity>();
-
-        using var reader = await command.ExecuteReaderAsync().ConfigureAwait(false);
-
-        // 从缓存获取属性信息（优化）
-        var type = typeof(TEntity);
-        var properties = DuckDBMetadataCache.GetOrAddProperties(type, t =>
-            t.GetProperties()
-                .Where(prop => !prop.GetCustomAttributes(typeof(NotMappedAttribute), true).Any())
-                .ToArray());
-
-        // 缓存列索引以提高性能
-        var columnMappings = BuildColumnMappings(reader, properties);
-
-        while (await reader.ReadAsync().ConfigureAwait(false))
-        {
-            var entity = MapReaderToEntity<TEntity>(reader, properties, columnMappings);
-            result.Add(entity);
-        }
-
-        return result;
-    }
-
-    /// <summary>
-    /// 构建列映射字典
-    /// </summary>
-    protected Dictionary<PropertyInfo, int> BuildColumnMappings(
-        System.Data.Common.DbDataReader reader,
-        PropertyInfo[] properties)
-    {
-        // 构建读取器列名到索引的映射
-        var columnIndexMap = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
-        for (int i = 0; i < reader.FieldCount; i++)
-        {
-            columnIndexMap[reader.GetName(i)] = i;
-        }
-
-        // 构建属性到列索引的映射
-        var result = new Dictionary<PropertyInfo, int>();
-        foreach (var property in properties)
-        {
-            // 获取列名（考虑特性标记）
-            string columnName = GetColumnNameFromProperty(property);
-
-            // 查找匹配的列索引
-            if (columnIndexMap.TryGetValue(columnName, out int columnIndex))
-            {
-                result[property] = columnIndex;
-            }
-        }
-
-        return result;
-    }
-
-    /// <summary>
-    /// 从属性获取列名
-    /// </summary>
-    protected string GetColumnNameFromProperty(PropertyInfo property)
-    {
-        // 这里可以扩展以支持自定义列名特性
-        // 例如 [Column("custom_name")]
-        return property.Name;
-    }
-
-    /// <summary>
-    /// 将读取器行映射为实体
-    /// </summary>
-    protected TEntity MapReaderToEntity<TEntity>(
-        System.Data.Common.DbDataReader reader,
-        PropertyInfo[] properties,
-        Dictionary<PropertyInfo, int> columnMappings)
-    {
-        TEntity entity = Activator.CreateInstance<TEntity>();
-
-        foreach (var property in properties)
-        {
-            // 只处理包含在映射中的属性
-            if (columnMappings.TryGetValue(property, out int columnIndex))
-            {
-                if (!reader.IsDBNull(columnIndex))
-                {
-                    try
-                    {
-                        var value = reader.GetValue(columnIndex);
-                        ConvertAndSetValue(entity, property, value);
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger.Warn($"转换属性 {property.Name} 失败: {ex.Message}");
-                    }
-                }
-            }
-        }
-
-        return entity;
-    }
-
-    /// <summary>
-    /// 转换数据库值并设置属性
-    /// </summary>
-    private void ConvertAndSetValue<TEntity>(TEntity entity, PropertyInfo property, object value)
-    {
-        try
-        {
-            if (value == DBNull.Value)
-                return; // 保持属性默认值
-
-            var targetType = property.PropertyType;
-
-            // 处理可空类型
-            var nullableType = Nullable.GetUnderlyingType(targetType);
-            if (nullableType != null)
-            {
-                targetType = nullableType;
-            }
-
-            // 处理枚举类型
-            if (targetType.IsEnum)
-            {
-                if (value is string strValue)
-                {
-                    property.SetValue(entity, Enum.Parse(targetType, strValue));
-                }
-                else
-                {
-                    property.SetValue(entity, Enum.ToObject(targetType, value));
-                }
-
-                return;
-            }
-
-            // 处理常见类型转换
-            if (value is decimal decValue && targetType == typeof(double))
-            {
-                property.SetValue(entity, Convert.ToDouble(decValue));
-                return;
-            }
-
-            if (value is long longValue && targetType == typeof(int))
-            {
-                property.SetValue(entity, Convert.ToInt32(longValue));
-                return;
-            }
-
-            // 通用转换
-            property.SetValue(entity, Convert.ChangeType(value, targetType));
-        }
-        catch (Exception ex)
-        {
-            _logger.Error($"设置属性 {property.Name} 值时发生异常: {ex.Message}", ex);
-            throw;
         }
     }
 
@@ -580,46 +967,6 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
             return valueTuple.Item1.Count;
 
         return 1; // 默认值为1，表示有结果
-    }
-
-    #endregion
-
-    #region 表达式处理辅助方法
-
-    /// <summary>
-    /// 从表达式中提取属性名
-    /// </summary>
-    protected string GetColumnName<TEntity, TProperty>(Expression<Func<TEntity, TProperty>> selector)
-    {
-        if (selector.Body is MemberExpression memberExpression)
-        {
-            return memberExpression.Member.Name;
-        }
-        else if (selector.Body is UnaryExpression unaryExpression &&
-                 unaryExpression.Operand is MemberExpression operandMemberExpression)
-        {
-            return operandMemberExpression.Member.Name;
-        }
-
-        throw new ArgumentException("表达式必须是属性访问表达式", nameof(selector));
-    }
-
-    /// <summary>
-    /// 获取实体的列名列表
-    /// </summary>
-    protected IEnumerable<string> GetEntityColumns<TEntity>()
-    {
-        // 优先从缓存获取列名
-        var type = typeof(TEntity);
-        return DuckDBMetadataCache.GetOrAddEntityColumns(type, t =>
-        {
-            // 排除未映射属性
-            var properties = t.GetProperties()
-                .Where(p => !p.GetCustomAttributes(typeof(NotMappedAttribute), true).Any());
-
-            // 为每个属性获取列名
-            return properties.Select(p => GetColumnNameFromProperty(p)).ToList();
-        });
     }
 
     #endregion
@@ -701,6 +1048,21 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     #endregion
 
     #region IDuckDBPerformanceMonitor 接口实现
+    
+    /// <summary>
+    /// 记录批处理进度
+    /// </summary>
+    public void RecordBatchProcessing(int itemCount)
+    {
+        // 使用现有的性能监控器方法记录批处理
+        _performanceMonitor.RecordQueryExecution(
+            "BatchProcessing",
+            "Streaming batch processed",
+            0,  // 文件数量
+            itemCount,  // 记录数量
+            0,  // 执行时间 - 这里我们只关心记录数
+            true);  // 成功标志
+    }
 
     /// <summary>
     /// 分析查询计划
