@@ -1,12 +1,13 @@
 ﻿using System.Collections.Concurrent;
 using System.Reflection;
+using Castle.Core.Logging;
 
 namespace Abp.DuckDB;
 
 /// <summary>
 /// DuckDB元数据缓存管理器，使用适应性淘汰策略
 /// </summary>
-public static class DuckDBMetadataCache
+public static class MetadataCache
 {
     #region 缓存存储
 
@@ -40,9 +41,27 @@ public static class DuckDBMetadataCache
     // 使用Ticks替代DateTime以支持原子操作
     private static long _lastCleanupTicks = DateTime.UtcNow.Ticks;
 
+    // 日志记录器
+    private static ILogger _logger = NullLogger.Instance;
+
+    // 缓存统计
+    private static int _expressionCacheHits = 0;
+    private static int _expressionCacheMisses = 0;
+
     #endregion
 
     #region 公共方法
+
+    /// <summary>
+    /// 设置日志记录器
+    /// </summary>
+    public static void SetLogger(ILogger logger)
+    {
+        if (logger != null)
+        {
+            Interlocked.Exchange(ref _logger, logger);
+        }
+    }
 
     /// <summary>
     /// 应用缓存配置
@@ -56,6 +75,10 @@ public static class DuckDBMetadataCache
             _config.MaxEntries = configuration.MaxCacheEntries;
             _config.EnableAdaptiveEviction = configuration.EnableAdaptiveEviction;
             _config.EvictionCheckInterval = TimeSpan.FromMinutes(configuration.CacheEvictionIntervalMinutes);
+
+            _logger.Info($"应用DuckDB缓存配置: MaxEntries={_config.MaxEntries}, " +
+                         $"EnableAdaptiveEviction={_config.EnableAdaptiveEviction}, " +
+                         $"EvictionInterval={_config.EvictionCheckInterval.TotalMinutes}分钟");
 
             // 初始化或重置清理计时器
             if (_cleanupTimer == null)
@@ -108,9 +131,25 @@ public static class DuckDBMetadataCache
     /// </summary>
     public static string GetOrAddExpressionSql(string expressionKey, Func<string, string> factory)
     {
-        var result = _expressionSqlCache.GetOrAdd(expressionKey, factory);
+        // 首先尝试从缓存获取
+        if (_expressionSqlCache.TryGetValue(expressionKey, out string cachedSql))
+        {
+            // 缓存命中
+            Interlocked.Increment(ref _expressionCacheHits);
+            RecordExpressionAccess(expressionKey);
+            return cachedSql;
+        }
+
+        // 缓存未命中
+        Interlocked.Increment(ref _expressionCacheMisses);
+
+        // 生成SQL
+        string generatedSql = factory(expressionKey);
+
+        // 添加到缓存
+        _expressionSqlCache[expressionKey] = generatedSql;
         RecordExpressionAccess(expressionKey);
-        return result;
+        return generatedSql;
     }
 
     /// <summary>
@@ -120,6 +159,8 @@ public static class DuckDBMetadataCache
     {
         try
         {
+            _logger.Info($"预热实体元数据: {entityType.Name}");
+
             // 确保属性已缓存
             if (!_propertiesCache.ContainsKey(entityType))
             {
@@ -163,7 +204,7 @@ public static class DuckDBMetadataCache
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"预热实体元数据失败: {ex.Message}");
+            _logger.Error($"预热实体元数据失败: {entityType.Name}, {ex.Message}", ex);
         }
     }
 
@@ -193,13 +234,15 @@ public static class DuckDBMetadataCache
             ? $"最常用表达式访问次数: {mostAccessedExpression.Value.AccessCount}"
             : "无表达式访问记录";
 
+        // 计算命中率
+        int totalExpressionRequests = _expressionCacheHits + _expressionCacheMisses;
+        double hitRate = totalExpressionRequests > 0
+            ? (double)_expressionCacheHits / totalExpressionRequests * 100
+            : 0;
+
         return $"元数据缓存项: {totalMetadataItems}, " +
                $"表达式缓存项: {expressionItems}, " +
-               $"属性缓存: {_propertiesCache.Count}, " +
-               $"列映射缓存: {_propertyColumnMappingsCache.Count}, " +
-               $"实体列名缓存: {_entityColumnsCache.Count}, " +
-               $"高频项: {highFrequencyItems}, " +
-               $"低频项: {lowFrequencyItems}, " +
+               $"表达式命中率: {hitRate:F2}%, " +
                $"{mostAccessedTypeInfo}, " +
                $"{mostAccessedExpressionInfo}";
     }
@@ -212,6 +255,8 @@ public static class DuckDBMetadataCache
     {
         if (evictionPercentage <= 0 || evictionPercentage > 100)
             evictionPercentage = 20;
+
+        _logger.Info($"执行手动清理缓存, 清除百分比: {evictionPercentage}%");
 
         lock (_lockObject)
         {
@@ -240,12 +285,17 @@ public static class DuckDBMetadataCache
     /// </summary>
     public static void ClearCache()
     {
+        _logger.Info("清空所有缓存");
+
         _propertiesCache.Clear();
         _propertyColumnMappingsCache.Clear();
         _entityColumnsCache.Clear();
         _expressionSqlCache.Clear();
         _accessMetrics.Clear();
         _expressionAccessMetrics.Clear();
+
+        Interlocked.Exchange(ref _expressionCacheHits, 0);
+        Interlocked.Exchange(ref _expressionCacheMisses, 0);
     }
 
     #endregion
@@ -324,12 +374,14 @@ public static class DuckDBMetadataCache
                 if (totalMetadataEntries > _config.MaxEntries * 0.9)
                 {
                     int entriesToRemove = (int)(totalMetadataEntries * 0.25);
+                    _logger.Info($"触发自动清理元数据缓存: {entriesToRemove}项");
                     PerformMetadataCleanup(entriesToRemove);
                 }
 
                 if (totalExpressionEntries > _config.MaxEntries * 0.9)
                 {
                     int entriesToRemove = (int)(totalExpressionEntries * 0.25);
+                    _logger.Info($"触发自动清理表达式缓存: {entriesToRemove}项");
                     PerformExpressionCleanup(entriesToRemove);
                 }
 
@@ -354,6 +406,7 @@ public static class DuckDBMetadataCache
             if (totalMetadataEntries > _config.MaxEntries)
             {
                 int entriesToRemove = (int)(totalMetadataEntries * 0.25); // 清理25%
+                _logger.Info($"执行定时元数据缓存清理: {entriesToRemove}项");
                 PerformMetadataCleanup(entriesToRemove);
             }
 
@@ -363,6 +416,7 @@ public static class DuckDBMetadataCache
             if (totalExpressionEntries > _config.MaxEntries)
             {
                 int entriesToRemove = (int)(totalExpressionEntries * 0.25); // 清理25%
+                _logger.Info($"执行定时表达式缓存清理: {entriesToRemove}项");
                 PerformExpressionCleanup(entriesToRemove);
             }
 
@@ -371,7 +425,7 @@ public static class DuckDBMetadataCache
         catch (Exception ex)
         {
             // 记录清理异常，但不抛出
-            Console.Error.WriteLine($"缓存清理异常: {ex.Message}");
+            _logger.Error($"缓存清理异常: {ex.Message}", ex);
         }
     }
 
@@ -460,12 +514,12 @@ public static class DuckDBMetadataCache
 
             if (removedCount > 10)
             {
-                Console.WriteLine($"[DuckDB元数据缓存] 已清理 {removedCount} 个低使用频率的元数据缓存项");
+                _logger.Info($"已清理 {removedCount} 个元数据缓存项");
             }
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"执行元数据缓存清理失败: {ex.Message}");
+            _logger.Error($"执行元数据缓存清理失败: {ex.Message}", ex);
         }
     }
 
@@ -536,12 +590,12 @@ public static class DuckDBMetadataCache
 
             if (removedCount > 10)
             {
-                Console.WriteLine($"[DuckDB表达式缓存] 已清理 {removedCount} 个低使用频率的表达式缓存项");
+                _logger.Info($"已清理 {removedCount} 个表达式缓存项");
             }
         }
         catch (Exception ex)
         {
-            Console.Error.WriteLine($"执行表达式缓存清理失败: {ex.Message}");
+            _logger.Error($"执行表达式缓存清理失败: {ex.Message}", ex);
         }
     }
 

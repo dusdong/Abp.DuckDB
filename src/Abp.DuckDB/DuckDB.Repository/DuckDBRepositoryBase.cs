@@ -32,7 +32,7 @@ public abstract class DuckDBRepositoryBase : IInitializable, IDisposable
 
     private readonly IDuckDBProvider _provider;
     private readonly ILogger _logger;
-    private readonly DuckDBSqlBuilder _sqlBuilder;
+    private readonly SqlBuilder _sqlBuilder;
     private bool _disposed = false;
     private bool _initialized = false;
     private readonly Regex _identifierPattern = new Regex(@"^[a-zA-Z0-9_]+$", RegexOptions.Compiled);
@@ -54,7 +54,7 @@ public abstract class DuckDBRepositoryBase : IInitializable, IDisposable
     {
         _provider = provider ?? throw new ArgumentNullException(nameof(provider));
         _logger = logger ?? throw new ArgumentNullException(nameof(logger));
-        _sqlBuilder = new DuckDBSqlBuilder(logger);
+        _sqlBuilder = new SqlBuilder(logger);
     }
 
     /// <summary>

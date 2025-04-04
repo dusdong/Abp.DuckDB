@@ -35,7 +35,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     protected readonly ConcurrentDictionary<string, PreparedStatementWrapper> _statementCache = new();
 
     // DuckDB SQL构建器
-    protected readonly DuckDBSqlBuilder _sqlBuilder;
+    protected readonly SqlBuilder _sqlBuilder;
 
     /// <summary>
     /// 预编译语句包装器，用于管理预编译语句的生命周期
@@ -70,7 +70,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     /// <param name="logger">日志记录器</param>
     /// <param name="sqlBuilder">SQL构建器</param>
     /// <param name="performanceMonitor">性能监视器，如果为null则创建新实例</param>
-    protected DuckDbProviderBase(ILogger logger, DuckDBSqlBuilder sqlBuilder, QueryPerformanceMonitor performanceMonitor = null)
+    protected DuckDbProviderBase(ILogger logger, SqlBuilder sqlBuilder, QueryPerformanceMonitor performanceMonitor = null)
     {
         _sqlBuilder = sqlBuilder ?? throw new ArgumentNullException(nameof(sqlBuilder));
         _logger = logger ?? NullLogger.Instance;
@@ -167,7 +167,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
             _configuration = configuration;
 
             // 应用配置到缓存系统
-            DuckDBMetadataCache.ApplyConfiguration(configuration);
+            MetadataCache.ApplyConfiguration(configuration);
 
             if (_configuration.UseConnectionPool)
             {
@@ -519,7 +519,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     /// </summary>
     protected PropertyInfo[] GetEntityProperties<TEntity>()
     {
-        return DuckDBMetadataCache.GetOrAddProperties(
+        return MetadataCache.GetOrAddProperties(
             typeof(TEntity),
             type => type.GetProperties(BindingFlags.Public | BindingFlags.Instance)
         );
@@ -530,7 +530,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     /// </summary>
     protected string[] GetEntityColumns<TEntity>()
     {
-        var columns = DuckDBMetadataCache.GetOrAddEntityColumns(
+        var columns = MetadataCache.GetOrAddEntityColumns(
             typeof(TEntity),
             type =>
             {
@@ -550,7 +550,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         // 缓存键
         string cacheKey = $"{typeof(TEntity).FullName}_{selector}";
 
-        return DuckDBMetadataCache.GetOrAddExpressionSql(
+        return MetadataCache.GetOrAddExpressionSql(
             cacheKey,
             _ =>
             {
@@ -1123,7 +1123,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         _logger.Debug("开始预热DuckDB元数据缓存");
         foreach (var entityType in entityTypes)
         {
-            DuckDBMetadataCache.PrewarmEntityMetadata(entityType);
+            MetadataCache.PrewarmEntityMetadata(entityType);
         }
 
         _logger.Debug($"DuckDB元数据缓存预热完成，共预热 {entityTypes.Length} 个实体类型");
@@ -1140,7 +1140,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         int count = 0;
         foreach (var entityType in entityTypes)
         {
-            DuckDBMetadataCache.PrewarmEntityMetadata(entityType);
+            MetadataCache.PrewarmEntityMetadata(entityType);
             count++;
         }
 
@@ -1163,8 +1163,8 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     public void CleanupCache(int evictionPercentage = 20)
     {
         _logger.Debug($"手动清理缓存，清理比例: {evictionPercentage}%");
-        DuckDBMetadataCache.ManualCleanup(evictionPercentage);
-        _logger.Info($"缓存清理完成，当前缓存状态: {DuckDBMetadataCache.GetStatistics()}");
+        MetadataCache.ManualCleanup(evictionPercentage);
+        _logger.Info($"缓存清理完成，当前缓存状态: {MetadataCache.GetStatistics()}");
     }
 
     /// <summary>
@@ -1173,7 +1173,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     public void ClearAllCaches()
     {
         _logger.Debug("清空所有元数据缓存");
-        DuckDBMetadataCache.ClearCache();
+        MetadataCache.ClearCache();
         _logger.Info("所有元数据缓存已清空");
     }
 
@@ -1182,7 +1182,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     /// </summary>
     public string GetCacheStatistics()
     {
-        return DuckDBMetadataCache.GetStatistics();
+        return MetadataCache.GetStatistics();
     }
 
     #endregion

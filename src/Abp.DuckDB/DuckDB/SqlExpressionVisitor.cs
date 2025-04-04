@@ -42,27 +42,86 @@ public class SqlExpressionVisitor : ExpressionVisitor
         if (expression == null)
             return string.Empty;
 
-        // 使用表达式字符串作为缓存键
-        string expressionKey = expression.ToString();
+        // 使用改进的方法生成唯一键
+        string expressionKey = GenerateUniqueExpressionKey(expression);
 
         // 从缓存获取或生成SQL表达式
-        string sql = DuckDBMetadataCache.GetOrAddExpressionSql(expressionKey, _ =>
+        string sql = MetadataCache.GetOrAddExpressionSql(expressionKey, _ =>
         {
             _sqlBuilder.Clear();
             Visit(expression.Body);
-            return _sqlBuilder.ToString();
+            string generatedSql = _sqlBuilder.ToString();
+            _logger.Debug($"生成SQL: {generatedSql} (表达式: {expression})");
+            return generatedSql;
         });
 
-        // 记录转换日志
-        _logger.Debug($"表达式 [{expression}] 被翻译为 SQL: [{sql}]");
-
         return sql;
+    }
+
+    /// <summary>
+    /// 生成唯一的表达式缓存键 - 改进版本
+    /// </summary>
+    private string GenerateUniqueExpressionKey<TEntity>(Expression<Func<TEntity, bool>> expression)
+    {
+        // 基本信息
+        var keyBuilder = new StringBuilder();
+        keyBuilder.Append(typeof(TEntity).FullName);
+        keyBuilder.Append("_");
+
+        // 提取表达式中的常量值和成员值
+        var constantExtractor = new ConstantExtractor();
+        constantExtractor.Visit(expression);
+
+        // 添加表达式结构信息
+        keyBuilder.Append(ExpressionToString(expression.Body));
+        keyBuilder.Append("_");
+
+        // 添加所有常量值到键中
+        int constIndex = 0;
+        foreach (var constant in constantExtractor.Constants)
+        {
+            keyBuilder.Append("C");
+            keyBuilder.Append(constIndex++);
+            keyBuilder.Append("=");
+            keyBuilder.Append(constant?.ToString() ?? "null");
+            keyBuilder.Append("_");
+        }
+
+        return keyBuilder.ToString();
+    }
+
+    /// <summary>
+    /// 将表达式转换为描述其结构的字符串（不包含具体值）
+    /// </summary>
+    private string ExpressionToString(Expression expression)
+    {
+        if (expression is BinaryExpression binary)
+        {
+            return $"{ExpressionToString(binary.Left)}{binary.NodeType}{ExpressionToString(binary.Right)}";
+        }
+        else if (expression is MemberExpression member)
+        {
+            return member.Member.Name;
+        }
+        else if (expression is ConstantExpression)
+        {
+            return "Const";
+        }
+        else if (expression is UnaryExpression unary)
+        {
+            return $"{unary.NodeType}{ExpressionToString(unary.Operand)}";
+        }
+        else if (expression is MethodCallExpression method)
+        {
+            return $"{method.Method.Name}()";
+        }
+
+        return expression.NodeType.ToString();
     }
 
     protected override Expression VisitBinary(BinaryExpression node)
     {
         _sqlBuilder.Append("(");
-
         Visit(node.Left);
 
         if (_operatorMap.TryGetValue(node.NodeType, out string sqlOperator))
@@ -75,7 +134,6 @@ public class SqlExpressionVisitor : ExpressionVisitor
         }
 
         Visit(node.Right);
-
         _sqlBuilder.Append(")");
 
         return node;
@@ -213,11 +271,20 @@ public class SqlExpressionVisitor : ExpressionVisitor
     /// </summary>
     private object GetMemberValue(MemberExpression member)
     {
-        // 处理嵌套成员访问，如 closure.field.Property
-        var objectMember = Expression.Convert(member, typeof(object));
-        var getterLambda = Expression.Lambda<Func<object>>(objectMember);
-        var getter = getterLambda.Compile();
-        return getter();
+        try
+        {
+            // 处理嵌套成员访问，如 closure.field.Property
+            var objectMember = Expression.Convert(member, typeof(object));
+            var getterLambda = Expression.Lambda<Func<object>>(objectMember);
+            var getter = getterLambda.Compile();
+            var value = getter();
+            return value;
+        }
+        catch (Exception ex)
+        {
+            _logger.Warn($"获取成员值失败: {member.Member.Name}, 错误: {ex.Message}");
+            return null;
+        }
     }
 
     /// <summary>
@@ -225,20 +292,28 @@ public class SqlExpressionVisitor : ExpressionVisitor
     /// </summary>
     private object GetExpressionValue(Expression expression)
     {
-        if (expression is ConstantExpression constExpr)
+        try
         {
-            return constExpr.Value;
-        }
+            if (expression is ConstantExpression constExpr)
+            {
+                return constExpr.Value;
+            }
 
-        if (expression is MemberExpression memberExpr)
+            if (expression is MemberExpression memberExpr)
+            {
+                return GetMemberValue(memberExpr);
+            }
+
+            var objectMember = Expression.Convert(expression, typeof(object));
+            var getterLambda = Expression.Lambda<Func<object>>(objectMember);
+            var getter = getterLambda.Compile();
+            return getter();
+        }
+        catch (Exception ex)
         {
-            return GetMemberValue(memberExpr);
+            _logger.Warn($"获取表达式值失败: {expression}, 错误: {ex.Message}");
+            return null;
         }
-
-        var objectMember = Expression.Convert(expression, typeof(object));
-        var getterLambda = Expression.Lambda<Func<object>>(objectMember);
-        var getter = getterLambda.Compile();
-        return getter();
     }
 
     /// <summary>
@@ -305,5 +380,39 @@ public class SqlExpressionVisitor : ExpressionVisitor
             .Replace("\\", "\\\\") // 首先转义反斜杠自身
             .Replace("%", "\\%") // 然后转义其他特殊字符
             .Replace("_", "\\_");
+    }
+
+    /// <summary>
+    /// 提取表达式中的常量值
+    /// </summary>
+    private class ConstantExtractor : ExpressionVisitor
+    {
+        public List<object> Constants { get; } = new List<object>();
+
+        protected override Expression VisitConstant(ConstantExpression node)
+        {
+            Constants.Add(node.Value);
+            return base.VisitConstant(node);
+        }
+
+        protected override Expression VisitMember(MemberExpression node)
+        {
+            if (node.Expression is ConstantExpression)
+            {
+                try
+                {
+                    var objectMember = Expression.Convert(node, typeof(object));
+                    var getterLambda = Expression.Lambda<Func<object>>(objectMember);
+                    var getter = getterLambda.Compile();
+                    Constants.Add(getter());
+                }
+                catch
+                {
+                    /* 忽略获取失败的情况 */
+                }
+            }
+
+            return base.VisitMember(node);
+        }
     }
 }

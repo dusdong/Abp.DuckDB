@@ -18,7 +18,7 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
     /// <param name="logger">日志记录器</param>
     /// <param name="sqlBuilder">SQL构建器</param>
     /// <param name="performanceMonitor">性能监视器</param>
-    public DuckDBFileQueryProvider(ILogger logger, DuckDBSqlBuilder sqlBuilder, QueryPerformanceMonitor performanceMonitor = null)
+    public DuckDBFileQueryProvider(ILogger logger, SqlBuilder sqlBuilder, QueryPerformanceMonitor performanceMonitor = null)
         : base(logger, sqlBuilder, performanceMonitor)
     {
         // 基类已经初始化了必要组件

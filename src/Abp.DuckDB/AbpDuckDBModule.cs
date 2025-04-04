@@ -9,7 +9,7 @@ public class AbpDuckDBModule : AbpModule
 {
     public override void PreInitialize()
     {
-        IocManager.Register<DuckDBSqlBuilder, DuckDBSqlBuilder>(DependencyLifeStyle.Transient);
+        IocManager.Register<SqlBuilder, SqlBuilder>(DependencyLifeStyle.Transient);
         
         IocManager.Register<QueryPerformanceMonitor, QueryPerformanceMonitor>(DependencyLifeStyle.Transient);
     }

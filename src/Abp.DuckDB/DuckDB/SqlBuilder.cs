@@ -7,7 +7,7 @@ namespace Abp.DuckDB;
 /// <summary>
 /// DuckDB SQL查询构建器类，负责生成所有SQL语句
 /// </summary>
-public class DuckDBSqlBuilder
+public class SqlBuilder
 {
     private readonly ILogger _logger;
     private readonly SqlExpressionVisitor _expressionVisitor;
@@ -16,7 +16,7 @@ public class DuckDBSqlBuilder
     /// 构造函数
     /// </summary>
     /// <param name="logger">日志记录器</param>
-    public DuckDBSqlBuilder(ILogger logger)
+    public SqlBuilder(ILogger logger)
     {
         _logger = logger ?? NullLogger.Instance;
         _expressionVisitor = new SqlExpressionVisitor(_logger);
@@ -138,7 +138,9 @@ public class DuckDBSqlBuilder
             sb.Append($" WHERE {whereClause}");
         }
 
-        return sb.ToString();
+        string sql = sb.ToString();
+        _logger.Debug($"生成SQL查询: {TruncateSql(sql)}");
+        return sql;
     }
 
     /// <summary>
@@ -158,7 +160,9 @@ public class DuckDBSqlBuilder
             sb.Append($" WHERE {whereClause}");
         }
 
-        return sb.ToString();
+        string sql = sb.ToString();
+        _logger.Debug($"生成计数SQL查询: {TruncateSql(sql)}");
+        return sql;
     }
 
     /// <summary>
@@ -182,7 +186,9 @@ public class DuckDBSqlBuilder
             sb.Append($" WHERE {whereClause}");
         }
 
-        return sb.ToString();
+        string sql = sb.ToString();
+        _logger.Debug($"生成聚合SQL查询: {TruncateSql(sql)}");
+        return sql;
     }
 
     /// <summary>
@@ -218,7 +224,9 @@ public class DuckDBSqlBuilder
         // 添加分页
         sb.Append($" LIMIT {limit} OFFSET {offset}");
 
-        return sb.ToString();
+        string finalSql = sb.ToString();
+        _logger.Debug($"生成分页SQL查询: LIMIT={limit}, OFFSET={offset}");
+        return finalSql;
     }
 
     /// <summary>
@@ -257,7 +265,9 @@ public class DuckDBSqlBuilder
             sb.Append($" LIMIT {resultLimit}");
         }
 
-        return sb.ToString();
+        string sql = sb.ToString();
+        _logger.Debug($"生成向量化过滤查询: 表={tableName}, 列数={columns.Length}");
+        return sql;
     }
 
     /// <summary>
@@ -296,5 +306,17 @@ public class DuckDBSqlBuilder
     {
         // 避免SQL注入和特殊字符问题
         return path?.Replace("'", "''");
+    }
+
+    /// <summary>
+    /// 截断SQL语句用于日志记录
+    /// </summary>
+    /// <param name="sql">SQL语句</param>
+    /// <param name="maxLength">最大长度</param>
+    /// <returns>截断后的SQL</returns>
+    private string TruncateSql(string sql, int maxLength = 200)
+    {
+        if (string.IsNullOrEmpty(sql)) return string.Empty;
+        return sql.Length <= maxLength ? sql : sql.Substring(0, maxLength) + "...";
     }
 }
