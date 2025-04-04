@@ -1362,6 +1362,58 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     }
 
     /// <summary>
+    /// 执行标量查询，返回首行首列的值
+    /// </summary>
+    /// <typeparam name="T">返回值类型</typeparam>
+    /// <param name="provider">DuckDB提供程序</param>
+    /// <param name="sql">SQL查询</param>
+    /// <param name="parameters">查询参数</param>
+    /// <returns>查询结果</returns>
+    public async Task<T> ExecuteScalarAsync<T>(string sql, params object[] parameters)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+        if (string.IsNullOrWhiteSpace(sql)) throw new ArgumentNullException(nameof(sql));
+
+        try
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = sql;
+
+            // 设置命令超时
+            if (_configuration.CommandTimeout != TimeSpan.Zero)
+            {
+                command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+            }
+
+            // 添加参数
+            if (parameters != null && parameters.Length > 0)
+            {
+                for (int i = 0; i < parameters.Length; i++)
+                {
+                    var parameter = new DuckDBParameter
+                    {
+                        ParameterName = $"p{i}",
+                        Value = parameters[i] ?? DBNull.Value
+                    };
+                    command.Parameters.Add(parameter);
+                }
+            }
+
+            var result = await command.ExecuteScalarAsync().ConfigureAwait(false);
+            if (result == DBNull.Value) return default;
+            if (result == null) return default;
+
+            // 使用 SafeConvert 方法进行更安全的类型转换
+            return DuckDBTypeConverter.SafeConvert<T>(result, _logger);
+        }
+        catch (Exception ex)
+        {
+            HandleException("执行标量查询", ex, sql);
+            return default; // 这里不会执行到
+        }
+    }
+
+    /// <summary>
     /// 带有限制和偏移的分页查询
     /// </summary>
     public async Task<List<TEntity>> QueryWithLimitOffsetAsync<TEntity>(

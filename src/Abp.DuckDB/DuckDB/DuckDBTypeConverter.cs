@@ -70,7 +70,8 @@ public static class DuckDBTypeConverter
         catch (Exception ex)
         {
             logger?.Error($"类型转换失败: {ex.Message}, 源类型: {value.GetType().Name}, 目标类型: {targetType.Name}", ex);
-            return default!;
+
+            throw new InvalidCastException($"无法将 '{value.GetType().Name}' 转换为 {targetType.Name}", ex);
         }
     }
 
@@ -105,7 +106,8 @@ public static class DuckDBTypeConverter
         {
             return Enum.Parse(enumType, strValue);
         }
-        else if (value is int || value is long || value is byte || value is short)
+
+        if (value is int || value is long || value is byte || value is short)
         {
             return Enum.ToObject(enumType, value);
         }
@@ -394,6 +396,7 @@ public static class DuckDBTypeConverter
         catch (Exception ex)
         {
             logger?.Error($"转换值 '{value}' ({value?.GetType().Name}) 到类型 '{targetType.Name}' 失败: {ex.Message}", ex);
+            
             throw new InvalidCastException($"无法将 '{value}' 转换为 {targetType.Name}", ex);
         }
     }
@@ -437,7 +440,8 @@ public static class DuckDBTypeConverter
         catch (Exception ex)
         {
             logger?.Error($"设置属性 {property.Name} 值时发生异常: {ex.Message}", ex);
-            // 不抛出异常，继续处理后续属性
+
+            throw new InvalidOperationException($"无法设置属性 '{property.Name}' 的值", ex);
         }
     }
 }
