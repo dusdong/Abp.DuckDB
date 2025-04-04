@@ -602,7 +602,7 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
                 if (isSimpleType)
                 {
                     var value = reader.GetValue(0);
-                    results.Add((TResult)Convert.ChangeType(value, type));
+                    results.Add(DuckDBTypeConverter.SafeConvert<TResult>(value, _logger));
                 }
                 else
                 {
@@ -875,8 +875,8 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
 
             while (await reader.ReadAsync(cancellationToken))
             {
-                var key = (TGroupKey)Convert.ChangeType(reader.GetValue(0), typeof(TGroupKey));
-                var count = (TResult)Convert.ChangeType(reader.GetValue(1), typeof(TResult));
+                var key = DuckDBTypeConverter.SafeConvert<TGroupKey>(reader.GetValue(0), _logger);
+                var count = DuckDBTypeConverter.SafeConvert<TResult>(reader.GetValue(1), _logger);
 
                 result.Add((key, count));
             }
@@ -937,8 +937,8 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
 
             while (await reader.ReadAsync(cancellationToken))
             {
-                var key = (TGroupKey)Convert.ChangeType(reader.GetValue(0), typeof(TGroupKey));
-                var sum = (TResult)Convert.ChangeType(reader.GetValue(1), typeof(TResult));
+                var key = DuckDBTypeConverter.SafeConvert<TGroupKey>(reader.GetValue(0), _logger);
+                var sum = DuckDBTypeConverter.SafeConvert<TResult>(reader.GetValue(1), _logger);
 
                 result.Add((key, sum));
             }
