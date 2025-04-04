@@ -1306,4 +1306,154 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     }
 
     #endregion
+
+    #region IDuckDBProviderAdvanced 方法实现 (从 DuckDbProviderAdvanced 移动过来)
+
+    /// <summary>
+    /// 获取DuckDB连接
+    /// </summary>
+    public DuckDBConnection GetDuckDBConnection()
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+        return _connection;
+    }
+
+    /// <summary>
+    /// 执行非查询SQL语句
+    /// </summary>
+    public async Task<int> ExecuteNonQueryAsync(string sql, params object[] parameters)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+        if (string.IsNullOrWhiteSpace(sql))
+            throw new ArgumentNullException(nameof(sql));
+
+        try
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = sql;
+
+            // 设置命令超时
+            if (_configuration.CommandTimeout != TimeSpan.Zero)
+            {
+                command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+            }
+
+            // 添加参数
+            if (parameters != null && parameters.Length > 0)
+            {
+                for (int i = 0; i < parameters.Length; i++)
+                {
+                    var parameter = new DuckDBParameter
+                    {
+                        ParameterName = $"p{i}",
+                        Value = parameters[i] ?? DBNull.Value
+                    };
+                    command.Parameters.Add(parameter);
+                }
+            }
+
+            return await command.ExecuteNonQueryAsync();
+        }
+        catch (Exception ex)
+        {
+            HandleException("执行非查询SQL语句", ex, sql);
+            return -1; // 这里不会执行到
+        }
+    }
+
+    /// <summary>
+    /// 带有限制和偏移的分页查询
+    /// </summary>
+    public async Task<List<TEntity>> QueryWithLimitOffsetAsync<TEntity>(
+        Expression<Func<TEntity, bool>> predicate = null,
+        int limit = 1000,
+        int offset = 0,
+        string orderByColumn = null,
+        bool ascending = true)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+
+        try
+        {
+            // 构建查询
+            var whereClause = _sqlBuilder.BuildWhereClause(predicate);
+            var orderClause = string.IsNullOrEmpty(orderByColumn)
+                ? string.Empty
+                : $" ORDER BY {orderByColumn} {(ascending ? "ASC" : "DESC")}";
+
+            var sql = $"SELECT * FROM {typeof(TEntity).Name}{whereClause}{orderClause} LIMIT {limit} OFFSET {offset}";
+
+            // 执行查询
+            return await ExecuteQueryWithMetricsAsync(
+                () => QueryWithRawSqlAsync<TEntity>(sql),
+                "LimitOffsetQuery",
+                sql);
+        }
+        catch (Exception ex)
+        {
+            HandleException("执行分页查询", ex);
+            return new List<TEntity>(); // 这里不会执行到
+        }
+    }
+
+    /// <summary>
+    /// 应用DuckDB优化设置
+    /// </summary>
+    public async Task ApplyOptimizationAsync()
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+
+        try
+        {
+            _logger.Debug("应用DuckDB优化设置");
+
+            // 应用各种优化设置
+            await ExecuteNonQueryAsync($"PRAGMA threads={_configuration.ThreadCount};");
+            _logger.Debug($"设置DuckDB线程数为: {_configuration.ThreadCount}");
+
+            if (!string.IsNullOrEmpty(_configuration.MemoryLimit))
+            {
+                await ExecuteNonQueryAsync($"PRAGMA memory_limit='{_configuration.MemoryLimit}';");
+                _logger.Debug($"设置DuckDB内存限制为: {_configuration.MemoryLimit}");
+            }
+
+            // 应用压缩设置
+            if (_configuration.EnableCompression)
+            {
+                await ExecuteNonQueryAsync($"PRAGMA force_compression='{_configuration.CompressionType}';");
+                _logger.Debug($"设置DuckDB压缩类型为: {_configuration.CompressionType}");
+            }
+
+            // 根据优化级别应用其他优化
+            switch (_configuration.OptimizationLevel)
+            {
+                case 3:
+                    // 最高级别优化 - 使用正确的参数名称
+                    await ExecuteNonQueryAsync("PRAGMA enable_object_cache=true;");
+                    await ExecuteNonQueryAsync("PRAGMA disabled_optimizers='';"); // 修正配置参数
+                    await ExecuteNonQueryAsync("PRAGMA force_index_join=true;");
+                    break;
+                case 2:
+                    // 中等级别优化
+                    await ExecuteNonQueryAsync("PRAGMA enable_object_cache=true;");
+                    await ExecuteNonQueryAsync("PRAGMA disabled_optimizers='';"); // 修正配置参数
+                    break;
+                case 1:
+                    // 基本优化
+                    await ExecuteNonQueryAsync("PRAGMA enable_object_cache=true;");
+                    break;
+                default:
+                    // 默认级别
+                    break;
+            }
+
+            _logger.Info("DuckDB优化设置应用完成");
+        }
+        catch (Exception ex)
+        {
+            HandleException("应用DuckDB优化设置", ex);
+        }
+    }
+
+    #endregion
 }

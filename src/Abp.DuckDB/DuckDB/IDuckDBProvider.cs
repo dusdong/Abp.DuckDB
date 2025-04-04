@@ -1,4 +1,7 @@
-﻿namespace Abp.DuckDB;
+﻿using System.Linq.Expressions;
+using DuckDB.NET.Data;
+
+namespace Abp.DuckDB;
 
 /// <summary>
 /// DuckDB 查询提供程序基础接口
@@ -85,4 +88,31 @@ public interface IDuckDBProvider : IDuckDBPerformanceMonitor, IDisposable
     /// 清除最近的执行日志
     /// </summary>
     void ClearExecutionLogs();
+
+    // 从 IDuckDBProviderAdvanced 合并的方法
+
+    /// <summary>
+    /// 获取原始DuckDB连接以执行高级操作
+    /// </summary>
+    DuckDBConnection GetDuckDBConnection();
+
+    /// <summary>
+    /// 执行非查询SQL语句
+    /// </summary>
+    Task<int> ExecuteNonQueryAsync(string sql, params object[] parameters);
+
+    /// <summary>
+    /// 带有限制和偏移的分页查询
+    /// </summary>
+    Task<List<TEntity>> QueryWithLimitOffsetAsync<TEntity>(
+        Expression<Func<TEntity, bool>> predicate = null,
+        int limit = 1000,
+        int offset = 0,
+        string orderByColumn = null,
+        bool ascending = true);
+
+    /// <summary>
+    /// 应用优化设置
+    /// </summary>
+    Task ApplyOptimizationAsync();
 }

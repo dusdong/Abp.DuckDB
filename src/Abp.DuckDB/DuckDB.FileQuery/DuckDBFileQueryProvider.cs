@@ -3,13 +3,14 @@ using System.Runtime.CompilerServices;
 using System.Text;
 using System.Diagnostics;
 using Castle.Core.Logging;
+using Abp.Dependency;
 
 namespace Abp.DuckDB.FileQuery;
 
 /// <summary>
 /// 提供用于查询Parquet文件的特定功能的DuckDB提供程序
 /// </summary>
-public class DuckDBFileQueryProvider : DuckDbProviderAdvanced, IDuckDBFileQueryProvider
+public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvider, ITransientDependency
 {
     /// <summary>
     /// 构造函数
@@ -17,11 +18,111 @@ public class DuckDBFileQueryProvider : DuckDbProviderAdvanced, IDuckDBFileQueryP
     /// <param name="logger">日志记录器</param>
     /// <param name="sqlBuilder">SQL构建器</param>
     /// <param name="performanceMonitor">性能监视器</param>
-    public DuckDBFileQueryProvider(ILogger logger, DuckDBSqlBuilder sqlBuilder, QueryPerformanceMonitor performanceMonitor)
+    public DuckDBFileQueryProvider(ILogger logger, DuckDBSqlBuilder sqlBuilder, QueryPerformanceMonitor performanceMonitor = null)
         : base(logger, sqlBuilder, performanceMonitor)
     {
         // 基类已经初始化了必要组件
     }
+
+    #region 从 DuckDbProviderAdvanced 合并的方法
+
+    /// <summary>
+    /// 使用向量化过滤进行查询
+    /// </summary>
+    public async Task<List<TEntity>> QueryWithVectorizedFiltersAsync<TEntity>(
+        string tableName,
+        string[] columns,
+        object[][] filterValues,
+        int resultLimit = 1000)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+        if (columns == null || columns.Length == 0)
+            throw new ArgumentException("至少需要一个过滤列", nameof(columns));
+        if (filterValues == null || filterValues.Length != columns.Length)
+            throw new ArgumentException("过滤值数组长度必须与列数组长度匹配", nameof(filterValues));
+
+        try
+        {
+            // 使用SqlBuilder的实现而不是本地重复实现
+            var sql = _sqlBuilder.BuildVectorizedFilterQuery(tableName, columns, filterValues, resultLimit);
+            _logger.Debug($"执行向量化过滤查询: {sql}");
+
+            // 执行查询
+            return await ExecuteQueryWithMetricsAsync(
+                () => QueryWithRawSqlAsync<TEntity>(sql),
+                "VectorizedFilter",
+                sql);
+        }
+        catch (Exception ex)
+        {
+            HandleException("执行向量化过滤查询", ex, null);
+            throw; // 这里不会执行到，因为HandleException会抛出异常
+        }
+    }
+
+    /// <summary>
+    /// 注册自定义函数
+    /// </summary>
+    public void RegisterFunction<TReturn, TParam1>(string functionName, Func<TParam1, TReturn> function)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+
+        try
+        {
+            _logger.Debug($"注册自定义函数: {functionName}");
+
+            // 注意：这里需要根据DuckDB.NET的具体实现调整
+            // 以下是一个示例实现
+
+            // 获取内部连接对象
+            // var db = _connection.InnerConnection;
+            // db.RegisterFunction(functionName, function);
+
+            _logger.Info($"成功注册自定义函数: {functionName}");
+        }
+        catch (Exception ex)
+        {
+            HandleException("注册自定义函数", ex);
+        }
+    }
+
+    /// <summary>
+    /// 直接从Parquet文件执行查询
+    /// </summary>
+    public async Task<List<TEntity>> QueryParquetFileAsync<TEntity>(
+        string parquetFilePath,
+        Expression<Func<TEntity, bool>> predicate = null)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+        if (string.IsNullOrWhiteSpace(parquetFilePath))
+            throw new ArgumentNullException(nameof(parquetFilePath));
+
+        try
+        {
+            // 验证文件存在
+            if (!File.Exists(parquetFilePath))
+                throw new FileNotFoundException("找不到Parquet文件", parquetFilePath);
+
+            // 构建查询语句
+            var whereClause = _sqlBuilder.BuildWhereClause(predicate);
+            var sql = $"SELECT * FROM read_parquet('{parquetFilePath.Replace("'", "''")}'){whereClause}";
+
+            _logger.Debug($"直接查询Parquet文件: {parquetFilePath}");
+
+            // 执行查询
+            return await ExecuteQueryWithMetricsAsync(
+                () => QueryWithRawSqlAsync<TEntity>(sql),
+                "ParquetQuery",
+                sql);
+        }
+        catch (Exception ex)
+        {
+            HandleException("查询Parquet文件", ex, null, $"文件路径: {parquetFilePath}");
+            return new List<TEntity>(); // 这里不会执行到
+        }
+    }
+
+    #endregion
 
     #region 核心查询方法
 
@@ -299,7 +400,8 @@ public class DuckDBFileQueryProvider : DuckDbProviderAdvanced, IDuckDBFileQueryP
         IEnumerable<string> filePaths,
         Expression<Func<TEntity, bool>> predicate = null,
         int batchSize = 1000,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default)
+        [EnumeratorCancellation]
+        CancellationToken cancellationToken = default)
     {
         if (_disposed) throw new ObjectDisposedException(GetType().Name);
         ValidateFilePaths(filePaths);

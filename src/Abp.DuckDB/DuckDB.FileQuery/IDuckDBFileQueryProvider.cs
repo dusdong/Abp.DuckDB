@@ -6,7 +6,7 @@ namespace Abp.DuckDB.FileQuery;
 /// <summary>
 /// DuckDB Parquet文件查询提供程序接口
 /// </summary>
-public interface IDuckDBFileQueryProvider : IDuckDBProviderAdvanced, IDisposable
+public interface IDuckDBFileQueryProvider : IDuckDBProvider
 {
     /// <summary>
     /// 查询Parquet文件
@@ -53,7 +53,31 @@ public interface IDuckDBFileQueryProvider : IDuckDBProviderAdvanced, IDisposable
         IEnumerable<string> filePaths,
         Expression<Func<TEntity, bool>> predicate = null,
         int batchSize = 1000,
-        [EnumeratorCancellation] CancellationToken cancellationToken = default);
+        [EnumeratorCancellation]
+        CancellationToken cancellationToken = default);
+
+    // 从 DuckDbProviderAdvanced 合并的方法
+
+    /// <summary>
+    /// 使用向量化批量过滤执行查询
+    /// </summary>
+    Task<List<TEntity>> QueryWithVectorizedFiltersAsync<TEntity>(
+        string tableName,
+        string[] columns,
+        object[][] filterValues,
+        int resultLimit = 1000);
+
+    /// <summary>
+    /// 注册C#自定义函数到DuckDB
+    /// </summary>
+    void RegisterFunction<TReturn, TParam1>(string functionName, Func<TParam1, TReturn> function);
+
+    /// <summary>
+    /// 直接从Parquet文件执行查询
+    /// </summary>
+    Task<List<TEntity>> QueryParquetFileAsync<TEntity>(
+        string parquetFilePath,
+        Expression<Func<TEntity, bool>> predicate = null);
 
     #region 聚合方法
 

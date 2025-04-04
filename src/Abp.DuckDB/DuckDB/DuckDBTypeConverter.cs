@@ -1,4 +1,5 @@
 ﻿using System.ComponentModel;
+using System.Numerics;
 using System.Reflection;
 using Castle.Core.Logging;
 
@@ -83,7 +84,7 @@ public static class DuckDBTypeConverter
                type == typeof(int) || type == typeof(uint) ||
                type == typeof(long) || type == typeof(ulong) ||
                type == typeof(float) || type == typeof(double) ||
-               type == typeof(decimal);
+               type == typeof(decimal) || type == typeof(BigInteger);
     }
 
     /// <summary>
@@ -119,6 +120,99 @@ public static class DuckDBTypeConverter
     /// </summary>
     private static object ConvertToNumericType(object value, Type targetType)
     {
+        // 处理BigInteger作为源类型的情况
+        if (value is BigInteger bigIntValue)
+        {
+            if (targetType == typeof(int))
+            {
+                if (bigIntValue <= int.MaxValue && bigIntValue >= int.MinValue)
+                    return (int)bigIntValue;
+                throw new OverflowException($"BigInteger值 {bigIntValue} 超出Int32范围。");
+            }
+
+            if (targetType == typeof(long))
+            {
+                if (bigIntValue <= long.MaxValue && bigIntValue >= long.MinValue)
+                    return (long)bigIntValue;
+                throw new OverflowException($"BigInteger值 {bigIntValue} 超出Int64范围。");
+            }
+
+            if (targetType == typeof(decimal))
+            {
+                if (bigIntValue <= (BigInteger)decimal.MaxValue && bigIntValue >= (BigInteger)decimal.MinValue)
+                    return (decimal)bigIntValue;
+                throw new OverflowException($"BigInteger值 {bigIntValue} 超出Decimal范围。");
+            }
+
+            if (targetType == typeof(double))
+                return (double)bigIntValue;
+
+            if (targetType == typeof(float))
+                return (float)bigIntValue;
+
+            if (targetType == typeof(uint))
+            {
+                if (bigIntValue <= uint.MaxValue && bigIntValue >= uint.MinValue)
+                    return (uint)bigIntValue;
+                throw new OverflowException($"BigInteger值 {bigIntValue} 超出UInt32范围。");
+            }
+
+            if (targetType == typeof(ulong))
+            {
+                if (bigIntValue <= ulong.MaxValue && bigIntValue >= ulong.MinValue)
+                    return (ulong)bigIntValue;
+                throw new OverflowException($"BigInteger值 {bigIntValue} 超出UInt64范围。");
+            }
+
+            if (targetType == typeof(byte))
+            {
+                if (bigIntValue <= byte.MaxValue && bigIntValue >= byte.MinValue)
+                    return (byte)bigIntValue;
+                throw new OverflowException($"BigInteger值 {bigIntValue} 超出Byte范围。");
+            }
+
+            if (targetType == typeof(sbyte))
+            {
+                if (bigIntValue <= sbyte.MaxValue && bigIntValue >= sbyte.MinValue)
+                    return (sbyte)bigIntValue;
+                throw new OverflowException($"BigInteger值 {bigIntValue} 超出SByte范围。");
+            }
+
+            if (targetType == typeof(short))
+            {
+                if (bigIntValue <= short.MaxValue && bigIntValue >= short.MinValue)
+                    return (short)bigIntValue;
+                throw new OverflowException($"BigInteger值 {bigIntValue} 超出Int16范围。");
+            }
+
+            if (targetType == typeof(ushort))
+            {
+                if (bigIntValue <= ushort.MaxValue && bigIntValue >= ushort.MinValue)
+                    return (ushort)bigIntValue;
+                throw new OverflowException($"BigInteger值 {bigIntValue} 超出UInt16范围。");
+            }
+
+            // 如果目标类型也是BigInteger，直接返回
+            if (targetType == typeof(BigInteger))
+                return bigIntValue;
+        }
+
+        // 处理BigInteger作为目标类型的情况
+        if (targetType == typeof(BigInteger))
+        {
+            if (value is int intValue)
+                return new BigInteger(intValue);
+            if (value is long longValue)
+                return new BigInteger(longValue);
+            if (value is decimal decimalValue)
+                return new BigInteger(decimalValue);
+            if (value is double doubleValue)
+                return new BigInteger(doubleValue);
+            if (value is string strValue)
+                return BigInteger.Parse(strValue);
+        }
+
+        // 原有的转换逻辑
         if (targetType == typeof(int)) return Convert.ToInt32(value);
         if (targetType == typeof(long)) return Convert.ToInt64(value);
         if (targetType == typeof(decimal)) return Convert.ToDecimal(value);
