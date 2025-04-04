@@ -13,10 +13,12 @@ public class DuckDBConnectionPool : IDisposable
     private readonly ConcurrentBag<PooledConnection> _availableConnections = new();
     private readonly ConcurrentDictionary<string, PooledConnection> _busyConnections = new();
     private readonly SemaphoreSlim _poolLock = new SemaphoreSlim(1, 1);
+    private readonly SemaphoreSlim _initializationLock = new SemaphoreSlim(1, 1);
     private readonly ILogger _logger;
     private readonly DuckDBPoolOptions _options;
     private int _totalConnections = 0;
     private bool _disposed;
+    private bool _shutdownRequested = false;
 
     public DuckDBConnectionPool(DuckDBPoolOptions options, ILogger logger)
     {
@@ -45,12 +47,16 @@ public class DuckDBConnectionPool : IDisposable
     /// </summary>
     public async Task<PooledConnection> GetConnectionAsync(CancellationToken cancellationToken = default)
     {
+        // 拒绝新连接请求如果正在关闭
+        if (_shutdownRequested)
+            throw new ObjectDisposedException(nameof(DuckDBConnectionPool), "连接池正在关闭");
+
         PooledConnection connection = null;
 
         // 尝试从可用连接获取
         if (_availableConnections.TryTake(out connection))
         {
-            // 检查连接是否可用
+            // 验证连接是否可用
             if (!IsConnectionValid(connection))
             {
                 SafeCloseConnection(connection);
@@ -67,10 +73,20 @@ public class DuckDBConnectionPool : IDisposable
                 // 检查是否达到最大连接数
                 if (_totalConnections >= _options.MaxConnections)
                 {
-                    // 等待一段时间，尝试再次获取可用连接
+                    // 等待一段时间，使用可取消的等待
+                    var waitTimeout = _options.ConnectionWaitTime;
                     _poolLock.Release();
-                    await Task.Delay(_options.ConnectionWaitTime, cancellationToken);
 
+                    try
+                    {
+                        await Task.Delay(waitTimeout, cancellationToken);
+                    }
+                    catch (TaskCanceledException)
+                    {
+                        throw new OperationCanceledException("获取连接操作被取消", cancellationToken);
+                    }
+
+                    // 再次尝试获取可用连接
                     if (_availableConnections.TryTake(out connection))
                     {
                         if (!IsConnectionValid(connection))
@@ -121,6 +137,14 @@ public class DuckDBConnectionPool : IDisposable
             if (_busyConnections.TryRemove(connection.Id, out _))
             {
                 connection.LastUsedTime = DateTime.UtcNow;
+
+                // 检查是否已请求关闭
+                if (_shutdownRequested)
+                {
+                    SafeCloseConnection(connection);
+                    Interlocked.Decrement(ref _totalConnections);
+                    return;
+                }
 
                 // 检查连接状态
                 if (IsConnectionValid(connection))
@@ -202,7 +226,7 @@ public class DuckDBConnectionPool : IDisposable
             {
                 using var command = connection.CreateCommand();
                 command.CommandText = "SELECT 1";
-                command.CommandTimeout = 5; // 短超时
+                command.CommandTimeout = 3; // 更短的超时，避免等待太久
                 command.ExecuteScalar();
             }
 
@@ -305,8 +329,22 @@ public class DuckDBConnectionPool : IDisposable
     {
         if (_disposed) return;
 
+        // 标记为正在关闭，阻止新请求
+        _shutdownRequested = true;
+
         try
         {
+            // 1. 设置一个超时时间等待活动连接完成工作
+            var waitTime = TimeSpan.FromSeconds(5);
+            var maxDelay = DateTimeOffset.UtcNow.Add(waitTime);
+
+            while (_busyConnections.Count > 0 && DateTimeOffset.UtcNow < maxDelay)
+            {
+                // 短暂等待一些活跃连接完成
+                Thread.Sleep(100);
+            }
+
+            // 2. 关闭并清理所有连接
             foreach (var conn in _availableConnections)
             {
                 SafeCloseConnection(conn);
@@ -321,6 +359,7 @@ public class DuckDBConnectionPool : IDisposable
 
             _busyConnections.Clear();
 
+            _initializationLock.Dispose();
             _poolLock.Dispose();
         }
         catch (Exception ex)

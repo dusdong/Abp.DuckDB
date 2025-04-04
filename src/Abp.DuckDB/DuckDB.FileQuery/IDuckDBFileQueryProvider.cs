@@ -53,8 +53,7 @@ public interface IDuckDBFileQueryProvider : IDuckDBProviderAdvanced, IDisposable
         IEnumerable<string> filePaths,
         Expression<Func<TEntity, bool>> predicate = null,
         int batchSize = 1000,
-        [EnumeratorCancellation]
-        CancellationToken cancellationToken = default);
+        [EnumeratorCancellation] CancellationToken cancellationToken = default);
 
     #region 聚合方法
 
@@ -90,6 +89,15 @@ public interface IDuckDBFileQueryProvider : IDuckDBProviderAdvanced, IDisposable
         CancellationToken cancellationToken = default);
 
     /// <summary>
+    /// 计算指定列的总和（基于列名）
+    /// </summary>
+    Task<TResult> SumAsync<TEntity, TResult>(
+        IEnumerable<string> filePaths,
+        string columnName,
+        Expression<Func<TEntity, bool>> predicate = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
     /// 计算列平均值
     /// </summary>
     Task<TResult> AvgAsync<TEntity, TResult>(
@@ -113,6 +121,14 @@ public interface IDuckDBFileQueryProvider : IDuckDBProviderAdvanced, IDisposable
     Task<TResult> MaxAsync<TEntity, TResult>(
         IEnumerable<string> filePaths,
         Expression<Func<TEntity, TResult>> selector,
+        Expression<Func<TEntity, bool>> predicate = null,
+        CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// 统计满足条件的记录数，返回指定类型
+    /// </summary>
+    Task<TResult> CountAsync<TEntity, TResult>(
+        IEnumerable<string> filePaths,
         Expression<Func<TEntity, bool>> predicate = null,
         CancellationToken cancellationToken = default);
 
@@ -141,14 +157,6 @@ public interface IDuckDBFileQueryProvider : IDuckDBProviderAdvanced, IDisposable
         Expression<Func<TEntity, bool>> predicate = null,
         string orderByColumn = null,
         bool ascending = true,
-        CancellationToken cancellationToken = default);
-
-    /// <summary>
-    /// 统计满足条件的记录数，返回指定类型
-    /// </summary>
-    Task<TResult> CountAsync<TEntity, TResult>(
-        IEnumerable<string> filePaths,
-        Expression<Func<TEntity, bool>> predicate = null,
         CancellationToken cancellationToken = default);
 
     #endregion

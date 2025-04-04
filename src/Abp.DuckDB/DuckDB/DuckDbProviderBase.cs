@@ -1,4 +1,5 @@
 ﻿using System.Collections.Concurrent;
+using System.Data;
 using System.Data.Common;
 using System.Diagnostics;
 using System.Linq.Expressions;
@@ -21,7 +22,7 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     private Timer _maintenanceTimer;
 
     // 性能监控相关 - 改为实例字段
-    protected readonly QueryPerformanceMonitor _performanceMonitor = new QueryPerformanceMonitor();
+    protected readonly QueryPerformanceMonitor _performanceMonitor;
 
     // 连接相关
     protected DuckDBConnection _connection;
@@ -69,11 +70,11 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     /// <param name="logger">日志记录器</param>
     /// <param name="sqlBuilder">SQL构建器</param>
     /// <param name="performanceMonitor">性能监视器，如果为null则创建新实例</param>
-    protected DuckDbProviderBase(ILogger logger, DuckDBSqlBuilder sqlBuilder, QueryPerformanceMonitor performanceMonitor)
+    protected DuckDbProviderBase(ILogger logger, DuckDBSqlBuilder sqlBuilder, QueryPerformanceMonitor performanceMonitor = null)
     {
-        _sqlBuilder = sqlBuilder;
+        _sqlBuilder = sqlBuilder ?? throw new ArgumentNullException(nameof(sqlBuilder));
         _logger = logger ?? NullLogger.Instance;
-        _configuration = DuckDBConfiguration.HighPerformance(); // 使用默认配置
+        _configuration = DuckDBConfiguration.Default; // 使用默认配置
         _performanceMonitor = performanceMonitor ?? new QueryPerformanceMonitor();
     }
 
@@ -453,12 +454,16 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         if (_configuration.CommandTimeout != TimeSpan.Zero)
             command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
 
-        using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        using var reader = await command.ExecuteReaderAsync(
+            CommandBehavior.SequentialAccess, // 使用顺序访问模式提高效率
+            cancellationToken);
 
         var properties = GetEntityProperties<TEntity>();
         var columnMappings = GetColumnMappings(reader, properties);
 
         var batch = new List<TEntity>(batchSize);
+        var stopwatch = Stopwatch.StartNew();
+        int batchCount = 0;
 
         while (await reader.ReadAsync(cancellationToken))
         {
@@ -470,10 +475,19 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
 
             if (batch.Count >= batchSize)
             {
+                batchCount++;
                 if (processAction != null)
                     await processAction(batch);
 
                 batch.Clear();
+
+                // 每处理10个批次记录一次进度
+                if (_configuration.EnablePerformanceMonitoring && batchCount % 10 == 0)
+                {
+                    double recordsPerSecond = totalProcessed / (stopwatch.ElapsedMilliseconds / 1000.0);
+                    _logger.Debug($"流处理进度: 已处理 {totalProcessed} 条记录, " +
+                                  $"吞吐量: {recordsPerSecond:F1} 记录/秒");
+                }
             }
         }
 
@@ -481,6 +495,16 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         if (batch.Count > 0 && processAction != null)
         {
             await processAction(batch);
+        }
+
+        // 记录总处理时间和吞吐量
+        if (_configuration.EnablePerformanceMonitoring && totalProcessed > 0)
+        {
+            stopwatch.Stop();
+            double recordsPerSecond = totalProcessed / (stopwatch.ElapsedMilliseconds / 1000.0);
+            _logger.Info($"流处理完成: {totalProcessed} 条记录, " +
+                         $"总耗时: {stopwatch.ElapsedMilliseconds}ms, " +
+                         $"吞吐量: {recordsPerSecond:F1} 记录/秒");
         }
 
         return totalProcessed;
@@ -761,6 +785,70 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
     }
 
     /// <summary>
+    /// 带重试的查询执行方法
+    /// </summary>
+    protected async Task<T> ExecuteQueryWithRetryAsync<T>(
+        Func<Task<T>> queryFunc,
+        string operationName,
+        string context = null)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+
+        int attempt = 0;
+        int maxRetries = _configuration.AutoRetryFailedQueries ? _configuration.MaxRetryCount : 0;
+
+        while (true)
+        {
+            try
+            {
+                attempt++;
+                return await queryFunc();
+            }
+            catch (Exception ex)
+            {
+                // 检查是否为可重试的异常
+                bool isRetryable = IsRetryableException(ex);
+
+                // 如果已达最大重试次数或异常不可重试，则抛出
+                if (attempt > maxRetries || !isRetryable)
+                {
+                    HandleException(operationName, ex, null, context);
+                    return default; // 这里不会执行到，HandleException会抛出异常
+                }
+
+                // 记录重试尝试
+                _logger.Warn($"{operationName} 失败 (尝试 {attempt}/{maxRetries}): {ex.Message}，准备重试...");
+
+                // 计算重试延迟
+                var delay = CalculateRetryDelay(attempt, _configuration.RetryInterval);
+                await Task.Delay(delay);
+            }
+        }
+    }
+
+    // 确定异常是否可重试
+    private bool IsRetryableException(Exception ex)
+    {
+        // 一些常见可重试异常
+        return ex is TimeoutException ||
+               ex is DuckDBOperationException duckEx && duckEx.Message.Contains("connection") ||
+               ex.Message.Contains("timeout") ||
+               ex.Message.Contains("temporarily unavailable");
+    }
+
+    // 计算指数退避的重试延迟
+    private TimeSpan CalculateRetryDelay(int attempt, TimeSpan baseInterval)
+    {
+        // 使用指数退避算法，但设置最大延迟为30秒
+        var jitter = new Random().Next(-500, 500); // ±500ms随机抖动
+        var milliseconds = Math.Min(
+            Math.Pow(2, attempt - 1) * baseInterval.TotalMilliseconds + jitter,
+            30000); // 最多30秒
+
+        return TimeSpan.FromMilliseconds(milliseconds);
+    }
+
+    /// <summary>
     /// 执行聚合查询，用于SUM, AVG, MIN, MAX等操作
     /// </summary>
     /// <typeparam name="TEntity">实体类型</typeparam>
@@ -834,47 +922,120 @@ public abstract class DuckDbProviderBase : IDuckDBProvider
         if (string.IsNullOrWhiteSpace(sql))
             throw new ArgumentNullException(nameof(sql));
 
+        return await ExecuteQueryWithRetryAsync<List<TEntity>>(
+            async () =>
+            {
+                using var command = _connection.CreateCommand();
+                command.CommandText = sql;
+
+                // 设置命令超时
+                if (_configuration.CommandTimeout != TimeSpan.Zero)
+                {
+                    command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+                }
+
+                if (parameters != null && parameters.Length > 0)
+                {
+                    for (int i = 0; i < parameters.Length; i++)
+                    {
+                        var parameter = new DuckDBParameter
+                        {
+                            ParameterName = $"p{i}",
+                            Value = parameters[i] ?? DBNull.Value
+                        };
+                        command.Parameters.Add(parameter);
+                    }
+                }
+
+                using var reader = await command.ExecuteReaderAsync();
+                var results = new List<TEntity>();
+                var properties = GetEntityProperties<TEntity>();
+                var columnMappings = GetColumnMappings(reader, properties);
+
+                while (await reader.ReadAsync())
+                {
+                    var entity = MapReaderToEntity<TEntity>(reader, properties, columnMappings);
+                    results.Add(entity);
+                }
+
+                return results;
+            },
+            "执行自定义SQL查询",
+            $"SQL: {sql}"
+        );
+    }
+
+    /// <summary>
+    /// 改进：执行分批处理查询，减少内存使用
+    /// </summary>
+    protected async Task<int> ExecuteBatchOperationAsync<TEntity>(
+        string operationName,
+        IEnumerable<TEntity> entities,
+        Func<List<TEntity>, Task<int>> batchOperationFunc,
+        int batchSize = 0,
+        CancellationToken cancellationToken = default)
+    {
+        if (_disposed) throw new ObjectDisposedException(GetType().Name);
+
+        // 使用配置的默认批大小，如果未指定
+        if (batchSize <= 0)
+            batchSize = _configuration.DefaultBatchSize;
+
+        // 限制批大小
+        batchSize = Math.Min(batchSize, _configuration.MaxBatchSize);
+
+        int totalProcessed = 0;
+        int batchNumber = 0;
+
         try
         {
-            using var command = _connection.CreateCommand();
-            command.CommandText = sql;
+            // 使用更内存高效的方式批处理
+            List<TEntity> batch = new List<TEntity>(batchSize);
+            var stopwatch = Stopwatch.StartNew();
 
-            // 设置命令超时
-            if (_configuration.CommandTimeout != TimeSpan.Zero)
+            foreach (var entity in entities)
             {
-                command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
-            }
+                cancellationToken.ThrowIfCancellationRequested();
 
-            if (parameters != null && parameters.Length > 0)
-            {
-                for (int i = 0; i < parameters.Length; i++)
+                batch.Add(entity);
+
+                if (batch.Count >= batchSize)
                 {
-                    var parameter = new DuckDBParameter
-                    {
-                        ParameterName = $"p{i}",
-                        Value = parameters[i] ?? DBNull.Value
-                    };
-                    command.Parameters.Add(parameter);
+                    batchNumber++;
+                    _logger.Debug($"执行{operationName}批次 #{batchNumber} (大小: {batch.Count})");
+
+                    int processedInBatch = await batchOperationFunc(batch);
+                    totalProcessed += processedInBatch;
+
+                    batch.Clear();
                 }
             }
 
-            using var reader = await command.ExecuteReaderAsync();
-            var results = new List<TEntity>();
-            var properties = GetEntityProperties<TEntity>();
-            var columnMappings = GetColumnMappings(reader, properties);
-
-            while (await reader.ReadAsync())
+            // 处理剩余项
+            if (batch.Count > 0)
             {
-                var entity = MapReaderToEntity<TEntity>(reader, properties, columnMappings);
-                results.Add(entity);
+                batchNumber++;
+                _logger.Debug($"执行{operationName}最终批次 #{batchNumber} (大小: {batch.Count})");
+
+                int processedInBatch = await batchOperationFunc(batch);
+                totalProcessed += processedInBatch;
             }
 
-            return results;
+            // 记录性能信息
+            stopwatch.Stop();
+            if (_configuration.EnablePerformanceMonitoring)
+            {
+                _logger.Info($"{operationName}完成: 处理 {totalProcessed} 项，" +
+                             $"耗时: {stopwatch.ElapsedMilliseconds}ms, " +
+                             $"批次数: {batchNumber}");
+            }
+
+            return totalProcessed;
         }
         catch (Exception ex)
         {
-            HandleException("执行自定义SQL查询", ex, sql);
-            return new List<TEntity>(); // 这里不会执行到
+            HandleException($"批量{operationName}", ex, null, $"批次 #{batchNumber}");
+            return 0; // 这里不会执行到
         }
     }
 

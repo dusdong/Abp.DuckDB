@@ -37,8 +37,8 @@ public static class DuckDBMetadataCache
     // 锁对象，用于安全初始化
     private static readonly object _lockObject = new object();
 
-    // 上次清理时间
-    private static DateTime _lastCleanupTime = DateTime.UtcNow;
+    // 使用Ticks替代DateTime以支持原子操作
+    private static long _lastCleanupTicks = DateTime.UtcNow.Ticks;
 
     #endregion
 
@@ -185,9 +185,13 @@ public static class DuckDBMetadataCache
             .OrderByDescending(x => x.Value.AccessCount)
             .FirstOrDefault();
 
-        string mostAccessedTypeInfo = mostAccessedType.Key != null ? $"最常访问类型: {mostAccessedType.Key.Name}({mostAccessedType.Value.AccessCount}次)" : "无类型访问记录";
+        string mostAccessedTypeInfo = mostAccessedType.Key != null
+            ? $"最常访问类型: {mostAccessedType.Key.Name}({mostAccessedType.Value.AccessCount}次)"
+            : "无类型访问记录";
 
-        string mostAccessedExpressionInfo = mostAccessedExpression.Key != null ? $"最常用表达式访问次数: {mostAccessedExpression.Value.AccessCount}" : "无表达式访问记录";
+        string mostAccessedExpressionInfo = mostAccessedExpression.Key != null
+            ? $"最常用表达式访问次数: {mostAccessedExpression.Value.AccessCount}"
+            : "无表达式访问记录";
 
         return $"元数据缓存项: {totalMetadataItems}, " +
                $"表达式缓存项: {expressionItems}, " +
@@ -295,38 +299,42 @@ public static class DuckDBMetadataCache
     /// </summary>
     private static void CheckAndCleanupIfNeeded()
     {
-        // 检查清理间隔
-        if ((DateTime.UtcNow - _lastCleanupTime) < TimeSpan.FromSeconds(30))
+        // 使用原子操作避免频繁进入锁内检查
+        var lastCleanupTicksSnapshot = Interlocked.Read(ref _lastCleanupTicks);
+        var currentTicks = DateTime.UtcNow.Ticks;
+
+        // 如果距离上次清理不足30秒，直接返回
+        if ((currentTicks - lastCleanupTicksSnapshot) < TimeSpan.FromSeconds(30).Ticks)
             return;
 
         int totalMetadataEntries = _propertiesCache.Count + _propertyColumnMappingsCache.Count + _entityColumnsCache.Count;
         int totalExpressionEntries = _expressionSqlCache.Count;
 
-        // 如果任一缓存项超过最大数量的80%，则执行清理
-        if (totalMetadataEntries > _config.MaxEntries * 0.8 ||
-            totalExpressionEntries > _config.MaxEntries * 0.8)
+        // 只有当缓存项超过阈值才清理，使用更高的阈值减少清理频率
+        if (totalMetadataEntries > _config.MaxEntries * 0.9 ||
+            totalExpressionEntries > _config.MaxEntries * 0.9)
         {
             lock (_lockObject)
             {
-                // 双重检查
-                if ((DateTime.UtcNow - _lastCleanupTime) < TimeSpan.FromSeconds(30))
+                // 再次检查，确保未被其他线程清理
+                if (Interlocked.Read(ref _lastCleanupTicks) != lastCleanupTicksSnapshot)
                     return;
 
-                // 清理元数据缓存
-                if (totalMetadataEntries > _config.MaxEntries * 0.8)
+                // 清理更多项（25%而非之前的20%）
+                if (totalMetadataEntries > _config.MaxEntries * 0.9)
                 {
-                    int entriesToRemove = (int)(totalMetadataEntries * 0.2); // 清理20%
+                    int entriesToRemove = (int)(totalMetadataEntries * 0.25);
                     PerformMetadataCleanup(entriesToRemove);
                 }
 
-                // 清理表达式缓存
-                if (totalExpressionEntries > _config.MaxEntries * 0.8)
+                if (totalExpressionEntries > _config.MaxEntries * 0.9)
                 {
-                    int entriesToRemove = (int)(totalExpressionEntries * 0.2); // 清理20%
+                    int entriesToRemove = (int)(totalExpressionEntries * 0.25);
                     PerformExpressionCleanup(entriesToRemove);
                 }
 
-                _lastCleanupTime = DateTime.UtcNow;
+                // 使用原子操作更新最后清理时间
+                Interlocked.Exchange(ref _lastCleanupTicks, currentTicks);
             }
         }
     }
@@ -345,7 +353,7 @@ public static class DuckDBMetadataCache
 
             if (totalMetadataEntries > _config.MaxEntries)
             {
-                int entriesToRemove = (int)(totalMetadataEntries * 0.2); // 清理20%
+                int entriesToRemove = (int)(totalMetadataEntries * 0.25); // 清理25%
                 PerformMetadataCleanup(entriesToRemove);
             }
 
@@ -354,11 +362,11 @@ public static class DuckDBMetadataCache
 
             if (totalExpressionEntries > _config.MaxEntries)
             {
-                int entriesToRemove = (int)(totalExpressionEntries * 0.2); // 清理20%
+                int entriesToRemove = (int)(totalExpressionEntries * 0.25); // 清理25%
                 PerformExpressionCleanup(entriesToRemove);
             }
 
-            _lastCleanupTime = DateTime.UtcNow;
+            Interlocked.Exchange(ref _lastCleanupTicks, DateTime.UtcNow.Ticks);
         }
         catch (Exception ex)
         {
@@ -376,16 +384,51 @@ public static class DuckDBMetadataCache
 
         try
         {
-            // 获取访问指标并按评分排序（低评分先淘汰）
+            // 1. 使用更高效的方式收集低优先级项目
+            var accessTimeThreshold = DateTime.UtcNow.AddHours(-3); // 3小时未访问的项为低优先级
+            var lowFrequencyThreshold = 5; // 访问次数低于5次为低优先级
+
+            // 2. 首先筛选出长时间未访问的低频率项
             var metrics = _accessMetrics.ToArray()
+                .Where(kvp => kvp.Value.AccessCount < lowFrequencyThreshold &&
+                              kvp.Value.LastAccessTime < accessTimeThreshold)
                 .Select(kvp => new { Type = kvp.Key, Metrics = kvp.Value })
-                .OrderBy(x => x.Metrics.CalculateScore())
+                .OrderBy(x => x.Metrics.LastAccessTime) // 先清理最旧的
                 .Take(entriesToRemove)
                 .ToList();
 
+            // 3. 如果符合条件的项不足，再加入一些低频率项
+            if (metrics.Count < entriesToRemove)
+            {
+                var remainingNeeded = entriesToRemove - metrics.Count;
+                var additionalMetrics = _accessMetrics.ToArray()
+                    .Where(kvp => kvp.Value.AccessCount < lowFrequencyThreshold &&
+                                  !metrics.Any(x => x.Type == kvp.Key))
+                    .Select(kvp => new { Type = kvp.Key, Metrics = kvp.Value })
+                    .OrderBy(x => x.Metrics.AccessCount)
+                    .Take(remainingNeeded)
+                    .ToList();
+
+                metrics.AddRange(additionalMetrics);
+            }
+
+            // 4. 如果还不足，使用传统评分
+            if (metrics.Count < entriesToRemove)
+            {
+                var remainingNeeded = entriesToRemove - metrics.Count;
+                var scoreMetrics = _accessMetrics.ToArray()
+                    .Where(kvp => !metrics.Any(x => x.Type == kvp.Key))
+                    .Select(kvp => new { Type = kvp.Key, Metrics = kvp.Value })
+                    .OrderBy(x => x.Metrics.CalculateScore())
+                    .Take(remainingNeeded)
+                    .ToList();
+
+                metrics.AddRange(scoreMetrics);
+            }
+
+            // 5. 执行淘汰
             int removedCount = 0;
 
-            // 执行淘汰
             foreach (var item in metrics)
             {
                 var type = item.Type;
@@ -415,7 +458,7 @@ public static class DuckDBMetadataCache
                 }
             }
 
-            if (removedCount > 0)
+            if (removedCount > 10)
             {
                 Console.WriteLine($"[DuckDB元数据缓存] 已清理 {removedCount} 个低使用频率的元数据缓存项");
             }
@@ -435,16 +478,51 @@ public static class DuckDBMetadataCache
 
         try
         {
-            // 获取表达式访问指标并按评分排序（低评分先淘汰）
+            // 1. 使用类似的优化策略清理表达式缓存
+            var accessTimeThreshold = DateTime.UtcNow.AddHours(-3);
+            var lowFrequencyThreshold = 5;
+
+            // 2. 首先清理长时间未访问的低频率项
             var metrics = _expressionAccessMetrics.ToArray()
+                .Where(kvp => kvp.Value.AccessCount < lowFrequencyThreshold &&
+                              kvp.Value.LastAccessTime < accessTimeThreshold)
                 .Select(kvp => new { ExpressionKey = kvp.Key, Metrics = kvp.Value })
-                .OrderBy(x => x.Metrics.CalculateScore())
+                .OrderBy(x => x.Metrics.LastAccessTime)
                 .Take(entriesToRemove)
                 .ToList();
 
+            // 3. 如果不足，添加更多低频率项
+            if (metrics.Count < entriesToRemove)
+            {
+                var remainingNeeded = entriesToRemove - metrics.Count;
+                var additionalMetrics = _expressionAccessMetrics.ToArray()
+                    .Where(kvp => kvp.Value.AccessCount < lowFrequencyThreshold &&
+                                  !metrics.Any(x => x.ExpressionKey == kvp.Key))
+                    .Select(kvp => new { ExpressionKey = kvp.Key, Metrics = kvp.Value })
+                    .OrderBy(x => x.Metrics.AccessCount)
+                    .Take(remainingNeeded)
+                    .ToList();
+
+                metrics.AddRange(additionalMetrics);
+            }
+
+            // 4. 如果还不足，使用评分
+            if (metrics.Count < entriesToRemove)
+            {
+                var remainingNeeded = entriesToRemove - metrics.Count;
+                var scoreMetrics = _expressionAccessMetrics.ToArray()
+                    .Where(kvp => !metrics.Any(x => x.ExpressionKey == kvp.Key))
+                    .Select(kvp => new { ExpressionKey = kvp.Key, Metrics = kvp.Value })
+                    .OrderBy(x => x.Metrics.CalculateScore())
+                    .Take(remainingNeeded)
+                    .ToList();
+
+                metrics.AddRange(scoreMetrics);
+            }
+
             int removedCount = 0;
 
-            // 执行淘汰
+            // 5. 执行淘汰
             foreach (var item in metrics)
             {
                 var expressionKey = item.ExpressionKey;
@@ -456,7 +534,7 @@ public static class DuckDBMetadataCache
                 }
             }
 
-            if (removedCount > 0)
+            if (removedCount > 10)
             {
                 Console.WriteLine($"[DuckDB表达式缓存] 已清理 {removedCount} 个低使用频率的表达式缓存项");
             }
