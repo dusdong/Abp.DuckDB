@@ -4,6 +4,7 @@ using System.Text;
 using System.Diagnostics;
 using Castle.Core.Logging;
 using Abp.Dependency;
+using System.Data.Common;
 
 namespace Abp.DuckDB.FileQuery;
 
@@ -541,6 +542,59 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
     }
 
     /// <summary>
+    /// 将数据记录映射到元组类型
+    /// </summary>
+    /// <typeparam name="T">元组类型</typeparam>
+    /// <param name="reader">数据记录</param>
+    /// <returns>映射后的元组</returns>
+    protected T MapToValueTuple<T>(DbDataReader reader) where T : struct
+    {
+        Type tupleType = typeof(T);
+        if (!tupleType.IsValueType || !tupleType.Name.StartsWith("ValueTuple"))
+            throw new ArgumentException($"类型 {tupleType.Name} 不是有效的元组类型");
+
+        // 获取元组字段信息
+        var fields = tupleType.GetFields();
+        var values = new object[fields.Length];
+
+        // 记录详细信息以便调试
+        var columnInfo = new List<string>();
+        for (int i = 0; i < reader.FieldCount; i++)
+        {
+            var columnName = reader.GetName(i);
+            var columnType = reader.GetFieldType(i);
+            var columnValue = reader.GetValue(i);
+            columnInfo.Add($"{columnName}({columnType.Name})={columnValue}");
+        }
+
+        _logger.Debug($"元组映射详情 - 字段数: {fields.Length}, 列数: {reader.FieldCount}, 元组类型: {tupleType.Name}");
+        _logger.Debug($"数据库列: {string.Join(", ", columnInfo)}");
+
+        // 按位置直接映射值，而不是依赖名称
+        for (int i = 0; i < Math.Min(fields.Length, reader.FieldCount); i++)
+        {
+            try
+            {
+                object value = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                Type fieldType = fields[i].FieldType;
+
+                // 转换并记录详细信息
+                _logger.Debug($"映射: 位置[{i}] 列[{reader.GetName(i)}] 到字段[{fields[i].Name}]({fieldType.Name}), 值={value}");
+                values[i] = DuckDBTypeConverter.SafeConvert(value, fieldType, _logger);
+            }
+            catch (Exception ex)
+            {
+                _logger.Error($"映射元组字段时出错: {ex.Message}", ex);
+                // 使用默认值
+                values[i] = fields[i].FieldType.IsValueType ? Activator.CreateInstance(fields[i].FieldType) : null;
+            }
+        }
+
+        // 创建并返回元组实例
+        return (T)Activator.CreateInstance(tupleType, values);
+    }
+
+    /// <summary>
     /// 执行自定义分组查询
     /// </summary>
     public async Task<List<TResult>> ExecuteGroupByQueryAsync<TResult>(
@@ -594,12 +648,19 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
             var results = new List<TResult>();
 
             var type = typeof(TResult);
+            var isValueTuple = type.IsValueType && type.Name.StartsWith("ValueTuple");
             var isSimpleType = type.IsPrimitive || type == typeof(string) || type == typeof(decimal) ||
                                type == typeof(DateTime) || Nullable.GetUnderlyingType(type) != null;
 
             while (await reader.ReadAsync(cancellationToken))
             {
-                if (isSimpleType)
+                if (isValueTuple)
+                {
+                    // 这里使用DbDataReader，修复转换问题
+                    var result = MapValueTupleResult<TResult>(reader);
+                    results.Add(result);
+                }
+                else if (isSimpleType)
                 {
                     var value = reader.GetValue(0);
                     results.Add(DuckDBTypeConverter.SafeConvert<TResult>(value, _logger));
@@ -613,6 +674,15 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
                 }
             }
 
+            // 添加SQL日志记录
+            _logger.Debug($"执行分组查询: {sql}");
+            if (parameters != null && parameters.Count > 0)
+            {
+                _logger.Debug($"查询参数: {string.Join(", ", parameters.Select(p => $"{p.Key}={p.Value}"))}");
+            }
+
+            _logger.Debug($"查询结果: {string.Join(", ", results.Select(r => r.ToString()))}");
+
             return results;
         }
         catch (Exception ex)
@@ -620,6 +690,28 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
             _logger.Error($"执行分组查询失败: {ex.Message}", ex);
             throw;
         }
+    }
+
+    /// <summary>
+    /// 安全处理ValueTuple映射结果，不需要约束TResult为struct
+    /// </summary>
+    private TResult MapValueTupleResult<TResult>(DbDataReader reader)
+    {
+        // 检查类型是否为ValueTuple
+        Type type = typeof(TResult);
+        if (type.IsValueType && type.Name.StartsWith("ValueTuple"))
+        {
+            // 动态创建泛型方法实例并调用
+            var method = typeof(DuckDBFileQueryProvider)
+                .GetMethod("MapToValueTuple", System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var genericMethod = method.MakeGenericMethod(type);
+            return (TResult)genericMethod.Invoke(this, new object[] { reader });
+        }
+
+        // 如果不是ValueTuple，使用标准方式处理
+        var properties = GetEntityProperties<TResult>();
+        var columnMappings = GetColumnMappings(reader, properties);
+        return MapReaderToEntity<TResult>(reader, properties, columnMappings);
     }
 
     /// <summary>
@@ -850,7 +942,7 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
             string dataSource = BuildDataSource(filePaths);
 
             // 构建分组SQL
-            string sql = $"SELECT {groupColumn}, COUNT(*) as Count FROM {dataSource}";
+            string sql = $"SELECT {groupColumn} AS Key, COUNT(*) AS Count FROM {dataSource}";
 
             if (!string.IsNullOrEmpty(whereClause))
                 sql += $" WHERE {whereClause}";
@@ -862,7 +954,10 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
             else
                 sql += $" ORDER BY Count {(ascending ? "ASC" : "DESC")}";
 
-            // 执行查询
+            _logger.Debug($"执行分组计数查询: {sql}");
+
+            // 直接执行SQL并手动转换结果
+            var results = new List<(TGroupKey Key, TResult Count)>();
             using var command = _connection.CreateCommand();
             command.CommandText = sql;
 
@@ -871,23 +966,47 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
 
             using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
-            var result = new List<(TGroupKey Key, TResult Count)>();
-
             while (await reader.ReadAsync(cancellationToken))
             {
                 var key = DuckDBTypeConverter.SafeConvert<TGroupKey>(reader.GetValue(0), _logger);
                 var count = DuckDBTypeConverter.SafeConvert<TResult>(reader.GetValue(1), _logger);
-
-                result.Add((key, count));
+                results.Add((key, count));
             }
 
-            return result;
+            return results;
         }
         catch (Exception ex)
         {
             _logger.Error($"分组计数失败: {ex.Message}", ex);
             throw;
         }
+    }
+
+    /// <summary>
+    /// 执行返回元组列表的查询
+    /// </summary>
+    public async Task<List<T>> ExecuteTupleQueryAsync<T>(
+        string sql,
+        CancellationToken cancellationToken = default) where T : struct
+    {
+        var results = new List<T>();
+
+        using var command = _connection.CreateCommand();
+        command.CommandText = sql;
+
+        if (_configuration.CommandTimeout != TimeSpan.Zero)
+            command.CommandTimeout = (int)_configuration.CommandTimeout.TotalSeconds;
+
+        using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            // 使用新的映射方法
+            var tuple = MapToValueTuple<T>(reader);
+            results.Add(tuple);
+        }
+
+        return results;
     }
 
     /// <summary>
@@ -912,7 +1031,7 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
             string dataSource = BuildDataSource(filePaths);
 
             // 构建分组求和SQL
-            string sql = $"SELECT {groupColumn}, SUM({sumColumn}) as Total FROM {dataSource}";
+            string sql = $"SELECT {groupColumn} AS Key, SUM({sumColumn}) AS Sum FROM {dataSource}";
 
             if (!string.IsNullOrEmpty(whereClause))
                 sql += $" WHERE {whereClause}";
@@ -922,9 +1041,12 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
             if (!string.IsNullOrEmpty(orderByColumn))
                 sql += $" ORDER BY {orderByColumn} {(ascending ? "ASC" : "DESC")}";
             else
-                sql += $" ORDER BY Total {(ascending ? "ASC" : "DESC")}";
+                sql += $" ORDER BY Sum {(ascending ? "ASC" : "DESC")}";
 
-            // 执行查询
+            _logger.Debug($"执行分组求和查询: {sql}");
+
+            // 直接执行SQL并手动转换结果
+            var results = new List<(TGroupKey Key, TResult Sum)>();
             using var command = _connection.CreateCommand();
             command.CommandText = sql;
 
@@ -933,17 +1055,14 @@ public class DuckDBFileQueryProvider : DuckDbProviderBase, IDuckDBFileQueryProvi
 
             using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
-            var result = new List<(TGroupKey Key, TResult Sum)>();
-
             while (await reader.ReadAsync(cancellationToken))
             {
                 var key = DuckDBTypeConverter.SafeConvert<TGroupKey>(reader.GetValue(0), _logger);
                 var sum = DuckDBTypeConverter.SafeConvert<TResult>(reader.GetValue(1), _logger);
-
-                result.Add((key, sum));
+                results.Add((key, sum));
             }
 
-            return result;
+            return results;
         }
         catch (Exception ex)
         {
